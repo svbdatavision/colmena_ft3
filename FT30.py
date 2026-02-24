@@ -1,0 +1,1565 @@
+"""
+Script optimizado para aplicar el modelo FastTrack 2.0 a TODAS las licencias médicas.
+Utiliza el método load_training_data existente para garantizar compatibilidad.
+
+ACTUALIZACIÓN 2025-08-06:
+- Se corrigió la inversión de probabilidades que estaba causando predicciones incorrectas
+- El modelo ahora predice directamente P(TARGET_FT3=1), no se necesita inversión
+- Se ajustaron los umbrales del semáforo:
+  * VERDE: P(aprobación) >= 0.80 (alta probabilidad)
+  * AMARILLO: 0.50 <= P(aprobación) < 0.80 (probabilidad media)
+  * ROJO: P(aprobación) < 0.50 (baja probabilidad)
+"""
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import sys
+sys.path.append('src')
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+
+from src.data_loader import SnowflakeDataLoader
+from src.feature_engineering import FeatureEngineer
+from src.model_training import LightGBMTrainer
+import joblib
+
+def align_features_with_model(X, model_path="models/fasttrack_model.pkl"):
+    """
+    Aligns the features of the transformed data with what the model expects.
+    This handles cases where feature engineering produces a different number of features.
+    """
+    # Load model to get expected features
+    model_data = joblib.load(model_path)
+    expected_features = model_data.get('feature_names', None)
+    
+    if expected_features is None:
+        # If no feature names stored, just return as is
+        return X
+    
+    # Convert to DataFrame if needed
+    if not isinstance(X, pd.DataFrame):
+        X = pd.DataFrame(X)
+    
+    # Get current features
+    current_features = X.columns.tolist()
+    
+    # Find missing and extra features
+    missing_features = set(expected_features) - set(current_features)
+    extra_features = set(current_features) - set(expected_features)
+    
+    if missing_features:
+        print(f"   ⚠ Missing {len(missing_features)} features, adding with zeros")
+        for feat in missing_features:
+            X[feat] = 0
+    
+    if extra_features:
+        print(f"   ⚠ Removing {len(extra_features)} extra features")
+        X = X.drop(columns=list(extra_features))
+    
+    # Reorder columns to match expected order
+    X = X[expected_features]
+    
+    return X
+
+def optimize_thresholds_by_cost(probabilities, true_labels, dias_solicitados, 
+                               cost_fp_per_day=59000, cost_fn=20000, cost_manual_review=5000,
+                               compin_reversion_rate=0.0):
+    """
+    Optimiza los umbrales del semáforo basándose en los costos de errores.
+    
+    Parámetros:
+    - probabilities: probabilidades predichas por el modelo
+    - true_labels: etiquetas verdaderas (1=aprobado, 0=rechazado)
+    - dias_solicitados: días solicitados para cada licencia
+    - cost_fp_per_day: costo por día de falso positivo (aprobar incorrectamente)
+    - cost_fn: costo de falso negativo (rechazar incorrectamente)
+    - cost_manual_review: costo de revisión manual por caso en zona amarilla
+    - compin_reversion_rate: tasa de reversión del COMPIN (0.0 a 1.0)
+    
+    Retorna:
+    - optimal_threshold_verde: umbral óptimo para zona verde
+    - optimal_threshold_amarillo: umbral óptimo para zona amarilla
+    - cost_analysis: análisis detallado de costos
+    
+    Nota sobre COMPIN:
+    Si compin_reversion_rate > 0, el costo efectivo de un FP se ajusta considerando
+    que un porcentaje de rechazos serán revertidos por COMPIN, resultando en:
+    Costo_efectivo_FP = dias * cost_fp_per_day * (1 - compin_reversion_rate) - cost_manual_review
+    """
+    
+    # Evaluar diferentes combinaciones de umbrales
+    # Ajustado para el rango real del modelo (max ~0.97)
+    verde_candidates = np.arange(0.50, 0.97, 0.001)  # Máximo 0.97 para modelo que alcanza 0.97
+    amarillo_candidates = np.arange(0.10, 0.80, 0.001)
+    
+    best_cost = float('inf')
+    best_verde = 0.94  # Valor por defecto para el modelo
+    best_amarillo = 0.20
+    cost_details = []
+    
+    print("\nOptimizando umbrales basados en costos...")
+    print(f"Estructura de costos:")
+    print(f"  - Falso Positivo: ${cost_fp_per_day:,} por día")
+    if compin_reversion_rate > 0:
+        print(f"    * Ajustado por COMPIN ({compin_reversion_rate*100:.0f}% reversión)")
+        print(f"    * Costo efectivo: ~${cost_fp_per_day * (1-compin_reversion_rate):,.0f} por día")
+    print(f"  - Falso Negativo: ${cost_fn:,}")
+    print(f"  - Revisión Manual: ${cost_manual_review:,} por caso")
+    
+    for verde_threshold in verde_candidates:
+        for amarillo_threshold in amarillo_candidates:
+            if amarillo_threshold >= verde_threshold:
+                continue
+                
+            # Clasificar según umbrales
+            verde_mask = probabilities >= verde_threshold
+            amarillo_mask = (probabilities >= amarillo_threshold) & (probabilities < verde_threshold)
+            rojo_mask = probabilities < amarillo_threshold
+            
+            # Calcular costos para zona verde (aprobación automática)
+            verde_fp = ((verde_mask) & (true_labels == 0)).sum()
+            verde_fn = 0  # No hay FN en verde porque aprobamos todos
+            
+            # Costo de FP en verde: días * costo por día
+            if compin_reversion_rate > 0 and verde_fp > 0:
+                # Ajustar costo considerando reversión COMPIN
+                dias_fp = dias_solicitados[(verde_mask) & (true_labels == 0)]
+                # Costo efectivo = dias * cost * (1 - tasa_reversion) - costo_manual_ahorrado
+                verde_fp_cost = np.maximum(dias_fp * cost_fp_per_day * (1 - compin_reversion_rate) - cost_manual_review, 0).sum()
+            else:
+                verde_fp_cost = (dias_solicitados[(verde_mask) & (true_labels == 0)] * cost_fp_per_day).sum()
+            
+            # Calcular costos para zona roja (rechazo automático)
+            rojo_fp = 0  # No hay FP en rojo porque rechazamos todos
+            rojo_fn = ((rojo_mask) & (true_labels == 1)).sum()
+            rojo_fn_cost = rojo_fn * cost_fn
+            
+            # CORRECCIÓN: Costo de revisión manual en zona amarilla
+            # Asumimos que la revisión manual tiene una tasa de error muy baja
+            # Por simplicidad, usamos solo el costo de revisión
+            amarillo_cost = amarillo_mask.sum() * cost_manual_review
+            
+            # Costo total
+            total_cost = verde_fp_cost + rojo_fn_cost + amarillo_cost
+            
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_verde = verde_threshold
+                best_amarillo = amarillo_threshold
+                
+                best_details = {
+                    'verde_threshold': verde_threshold,
+                    'amarillo_threshold': amarillo_threshold,
+                    'total_cost': total_cost,
+                    'verde_cases': verde_mask.sum(),
+                    'amarillo_cases': amarillo_mask.sum(),
+                    'rojo_cases': rojo_mask.sum(),
+                    'verde_fp': verde_fp,
+                    'verde_fp_cost': verde_fp_cost,
+                    'rojo_fn': rojo_fn,
+                    'rojo_fn_cost': rojo_fn_cost,
+                    'amarillo_cost': amarillo_cost
+                }
+    
+    # Calcular métricas con umbrales óptimos
+    verde_mask = probabilities >= best_verde
+    amarillo_mask = (probabilities >= best_amarillo) & (probabilities < best_verde)
+    rojo_mask = probabilities < best_amarillo
+    
+    # Precisión en cada zona
+    verde_precision = (true_labels[verde_mask] == 1).mean() if verde_mask.sum() > 0 else 0
+    rojo_precision = (true_labels[rojo_mask] == 0).mean() if rojo_mask.sum() > 0 else 0
+    
+    print(f"\nUmbrales óptimos encontrados:")
+    print(f"  - VERDE (aprobación automática): >= {best_verde:.2f}")
+    print(f"  - AMARILLO (revisión manual): {best_amarillo:.2f} - {best_verde:.2f}")
+    print(f"  - ROJO (rechazo automático): < {best_amarillo:.2f}")
+    
+    print(f"\nDistribución de casos:")
+    print(f"  - Verde: {best_details['verde_cases']:,} ({best_details['verde_cases']/len(probabilities)*100:.1f}%)")
+    print(f"  - Amarillo: {best_details['amarillo_cases']:,} ({best_details['amarillo_cases']/len(probabilities)*100:.1f}%)")
+    print(f"  - Rojo: {best_details['rojo_cases']:,} ({best_details['rojo_cases']/len(probabilities)*100:.1f}%)")
+    
+    print(f"\nCostos estimados:")
+    print(f"  - Costo FP en verde: ${best_details['verde_fp_cost']:,.0f} ({best_details['verde_fp']} casos)")
+    print(f"  - Costo FN en rojo: ${best_details['rojo_fn_cost']:,.0f} ({best_details['rojo_fn']} casos)")
+    print(f"  - Costo revisión manual (amarillo): ${best_details['amarillo_cost']:,.0f}")
+    print(f"  - COSTO TOTAL: ${best_details['total_cost']:,.0f}")
+    
+    print(f"\nPrecisión por zona:")
+    print(f"  - Verde: {verde_precision:.1%}")
+    print(f"  - Rojo: {rojo_precision:.1%}")
+    
+    return best_verde, best_amarillo, best_details
+
+
+def apply_model_to_all_licenses(date_from=None, date_to=None, 
+                               optimize_thresholds=True, cost_manual_review=500, 
+                               compin_reversion_rate=0.0):
+    """
+    Aplicar modelo a todas las licencias del período usando la estructura existente.
+    
+    Parámetros:
+    - date_from: fecha inicial del período (None = día anterior)
+    - date_to: fecha final del período (None = día anterior)
+    - optimize_thresholds: si optimizar umbrales basado en costos
+    - cost_manual_review: costo de revisión manual por caso
+    - compin_reversion_rate: tasa de reversión del COMPIN (0.0 a 1.0)
+                            Si es 0.5, significa que 50% de rechazos son revertidos
+    """
+    
+    # Establecer fechas por defecto si no se proporcionan
+    from datetime import datetime, timedelta
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    if date_from is None:
+        date_from = yesterday
+    if date_to is None:
+        date_to = yesterday
+    
+    print("="*80)
+    print("APLICACIÓN DE MODELO FASTTRACK 3.0")
+    print("="*80)
+    if date_from == date_to and date_from == yesterday:
+        print("Procesando: Licencias sin dictamen de MODELO_LM_202507_TRAIN")
+    else:
+        print(f"Período: {date_from} al {date_to}")
+    print("Excluyendo: PARTO y PUERPERIO")
+    
+    # Inicializar componentes
+    loader = SnowflakeDataLoader()
+    trainer = LightGBMTrainer()
+    trainer.load_model('models/fasttrack_model.pkl')
+    engineer = FeatureEngineer()
+    engineer.load_transformers('models/feature_fasttrack.pkl')
+    
+    try:
+        loader.connect()
+        
+        # 1. CARGAR TODAS LAS LICENCIAS DEL PERÍODO
+        print("\n1. Cargando licencias del período...")
+        
+        # Si no se especifican fechas, cargar solo licencias sin dictamen
+        if date_from == date_to and date_from == yesterday:
+            print("   Modo: Procesando SOLO licencias sin dictamen (pendientes)")
+            query_todas = """
+            SELECT *
+            FROM MODELO_LM_202507_TRAIN
+            WHERE TARGET_APRUEBA IS NULL
+            AND CIE_GRUPO NOT IN ('PARTO', 'PUERPERIO')
+            AND CIE_GRUPO IS NOT NULL
+            AND TRIM(CIE_GRUPO) != ''
+            """
+        else:
+            # Si se especifican fechas, usar el filtro de fechas
+            print("   Modo: Procesando licencias del período especificado")
+            query_todas = f"""
+            SELECT *
+            FROM MODELO_LM_202507_TRAIN
+            WHERE FECHA_RECEPCION BETWEEN '{date_from}' AND '{date_to}'
+            AND CIE_GRUPO NOT IN ('PARTO', 'PUERPERIO')
+            AND CIE_GRUPO IS NOT NULL
+            AND TRIM(CIE_GRUPO) != ''
+            """
+        
+        df_todas = pd.read_sql(query_todas, loader.conn)
+        print(f"   Total licencias cargadas: {len(df_todas):,}")
+
+        operador_map = None
+        if 'LCC_OPERADOR' in df_todas.columns and 'LCC_COMCOR' in df_todas.columns:
+            operador_map_series = (
+                df_todas[['LCC_COMCOR', 'LCC_OPERADOR']]
+                .dropna(subset=['LCC_OPERADOR'])
+                .drop_duplicates(subset=['LCC_COMCOR'])
+                .set_index('LCC_COMCOR')['LCC_OPERADOR']
+            )
+            operador_map_series = pd.to_numeric(operador_map_series, errors='coerce')
+            operador_map = operador_map_series.dropna().to_dict()
+            operador_map_str = {str(k): v for k, v in operador_map.items()}
+            operador_map.update(operador_map_str)
+        else:
+            operador_map = None
+        
+        # Separar en con dictamen y pendientes basado en TARGET_APRUEBA
+        # Las pendientes son las que tienen TARGET_APRUEBA = NULL (sin dictamen aún)
+        df_con_dictamen = df_todas[df_todas['TARGET_APRUEBA'].notna()].copy()
+        df_pendientes_real = df_todas[df_todas['TARGET_APRUEBA'].isna()].copy()
+        
+        print(f"   - Con dictamen: {len(df_con_dictamen):,}")
+        print(f"   - Pendientes (sin dictamen): {len(df_pendientes_real):,}")
+        
+        # Información adicional sobre FT1 y TARGET_FT3
+        if 'LEAK_FT' in df_con_dictamen.columns:
+            ft1_count = (df_con_dictamen['LEAK_FT'] == 1).sum()
+            print(f"   - Pasaron por FastTrack 1.0: {ft1_count:,}")
+        
+        if 'TARGET_FT3' in df_con_dictamen.columns:
+            target_1 = (df_con_dictamen['TARGET_FT3'] == 1).sum()
+            target_0 = (df_con_dictamen['TARGET_FT3'] == 0).sum()
+            target_null = df_con_dictamen['TARGET_FT3'].isna().sum()
+            print(f"   - TARGET_FT3=1 (auto-aprobable): {target_1:,}")
+            print(f"   - TARGET_FT3=0 (requiere revisión): {target_0:,}")
+            print(f"   - TARGET_FT3=NULL (excluidas de entrenamiento): {target_null:,}")
+        
+        # Filtrar PARTO/PUERPERIO
+        if 'CIE_GRUPO' in df_con_dictamen.columns:
+            df_con_dictamen = df_con_dictamen[
+                ~df_con_dictamen['CIE_GRUPO'].isin(['PARTO', 'PUERPERIO'])
+            ]
+        
+        print(f"✓ Licencias con dictamen cargadas: {len(df_con_dictamen):,}")
+        
+        # Guardar información relevante para la validación y para el guardado en Snowflake
+        columnas_base_output = [
+            'AFILIADO_RUT', 'LCC_COMCOD', 'LCC_COMCOR', 'LCC_OPERADOR', 'LCC_MEDRUT', 'LCC_EMPRUT',
+            'LCC_IDN', 'EPISODIO_ACUM_DIAS', 'EPISODIO_FEC_INI', 'CONTINUA_CALC', 'TIPO_F_LM_COD', 'TIPO_F_LM',
+            'FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'DIASSOLICITADO', 'CIE_F', 'CIE_F_COD',
+            'CIE_GRUPO', 'LM_DIAGNOSTICO', 'LM_ANTECEDENTES_CLINICOS', 'COT_EDAD', 'COT_GENERO', 'RENTA_ESTIMADA'
+        ]
+
+        columnas_validacion = [
+            'TARGET_FT3', 'TARGET_APRUEBA',
+            'LEAK_FT', 'LEAK_DIASAUTORIZADOS', 'LEAK_CAUSALES',
+            'LEAK_GLOSAS', 'LEAK_ESTADOLM', 'LEAK_FALLO_PE'
+        ]
+
+        columnas_info_extra = [
+            'FECHA_EMISION_DT',
+            'PRESTADOR_RUT',
+            'PRESTADOR_LOCAL_RUT',
+            'EMPLEADOR_RUT',
+            'N_LICENCIA'
+        ]
+        columnas_info = list(dict.fromkeys(columnas_base_output + columnas_info_extra + columnas_validacion))
+        columnas_disponibles = [col for col in columnas_info if col in df_con_dictamen.columns]
+        info_con_dictamen = df_con_dictamen[columnas_disponibles].copy()
+        if operador_map is not None and 'LCC_COMCOR' in info_con_dictamen.columns:
+            if 'LCC_OPERADOR' not in info_con_dictamen.columns:
+                info_con_dictamen['LCC_OPERADOR'] = None
+            info_con_dictamen['LCC_OPERADOR'] = pd.to_numeric(info_con_dictamen['LCC_OPERADOR'], errors='coerce')
+            info_con_dictamen['LCC_OPERADOR'] = info_con_dictamen['LCC_OPERADOR'].where(
+                info_con_dictamen['LCC_OPERADOR'].notna(),
+                info_con_dictamen['LCC_COMCOR'].map(operador_map)
+            )
+        
+        # 2. PREPARAR LICENCIAS PENDIENTES
+        print("\n2. Preparando licencias pendientes...")
+        
+        # Ya tenemos df_pendientes_real del paso anterior
+        df_pendientes = df_pendientes_real.copy()
+        
+        # Filtrar PARTO/PUERPERIO también en pendientes (igual que en con_dictamen)
+        if 'CIE_GRUPO' in df_pendientes.columns:
+            n_before = len(df_pendientes)
+            df_pendientes = df_pendientes[
+                ~df_pendientes['CIE_GRUPO'].isin(['PARTO', 'PUERPERIO'])
+            ]
+            n_filtered = n_before - len(df_pendientes)
+            if n_filtered > 0:
+                print(f"   - Excluidas {n_filtered:,} licencias de PARTO/PUERPERIO")
+        
+        # IMPORTANTE: Asegurar que pendientes tiene TODAS las columnas de entrenamiento
+        # Usar la función de fix_pending_features para garantizar compatibilidad
+        print("   - Asegurando que df_pendientes tiene todas las columnas requeridas...")
+        # Ya no es necesario - el fix se aplica después del transform
+        # df_pendientes = create_complete_dataframe(df_pendientes, df_con_dictamen)
+        
+        # CRITICAL FIX: Since FECHA_EMP_ENVIO was NULL during training,
+        # we need to set it to NaT/None for pending licenses too to ensure consistency
+        if 'FECHA_EMP_ENVIO' in df_pendientes.columns and 'FECHA_EMP_ENVIO' in df_con_dictamen.columns:
+            # Convert to datetime to check properly
+            train_fecha = pd.to_datetime(df_con_dictamen['FECHA_EMP_ENVIO'], errors='coerce')
+            if train_fecha.isna().all():
+                print("   - FECHA_EMP_ENVIO was null in training, setting to None in pending for consistency")
+                df_pendientes['FECHA_EMP_ENVIO'] = None
+        
+        print(f"✓ Licencias pendientes cargadas: {len(df_pendientes):,}")
+        
+        # Asegurar que las columnas de validación existan en pendientes (pueden ser NULL)
+        for col in columnas_validacion:
+            if col not in df_pendientes.columns:
+                df_pendientes[col] = None  # Añadir como NULL para pendientes
+        
+        # Guardar información de pendientes
+        columnas_disponibles_pendientes = [col for col in columnas_info if col in df_pendientes.columns]
+        info_pendientes = df_pendientes[columnas_disponibles_pendientes].copy()
+        if operador_map is not None and 'LCC_COMCOR' in info_pendientes.columns:
+            if 'LCC_OPERADOR' not in info_pendientes.columns:
+                info_pendientes['LCC_OPERADOR'] = None
+            info_pendientes['LCC_OPERADOR'] = pd.to_numeric(info_pendientes['LCC_OPERADOR'], errors='coerce')
+            info_pendientes['LCC_OPERADOR'] = info_pendientes['LCC_OPERADOR'].where(
+                info_pendientes['LCC_OPERADOR'].notna(),
+                info_pendientes['LCC_COMCOR'].map(operador_map)
+            )
+        
+        # Las licencias pendientes no tienen TARGET_FT3 real porque no tienen resolución aún
+        # PARTO/PUERPERIO ya fueron filtradas arriba
+        # El resto de pendientes se procesarán normalmente para estimar su probabilidad
+        df_pendientes['TARGET_FT3'] = np.nan  # NULL porque no tienen dictamen aún
+        
+        # 3. APLICAR MODELO
+        print("\n3. Aplicando modelo FastTrack 2.0...")
+        
+        # Crear una copia para predicción sin modificar los originales
+        df_con_dictamen_pred = df_con_dictamen.copy()
+        df_pendientes_pred = df_pendientes.copy()
+        
+        # Apply the FECHA_EMP_ENVIO fix to the prediction copy as well
+        if 'FECHA_EMP_ENVIO' in df_pendientes_pred.columns and 'FECHA_EMP_ENVIO' in df_con_dictamen_pred.columns:
+            train_fecha = pd.to_datetime(df_con_dictamen_pred['FECHA_EMP_ENVIO'], errors='coerce')
+            pend_fecha = pd.to_datetime(df_pendientes_pred['FECHA_EMP_ENVIO'], errors='coerce')
+            print(f"   - FECHA_EMP_ENVIO check: training has {train_fecha.notna().sum()} non-null, pending has {pend_fecha.notna().sum()} non-null")
+            if train_fecha.isna().all() and pend_fecha.notna().any():
+                print("   - Setting FECHA_EMP_ENVIO to None in pending for consistency with training")
+                df_pendientes_pred['FECHA_EMP_ENVIO'] = None
+                # Verify the change
+                print(f"   - After fix: {df_pendientes_pred['FECHA_EMP_ENVIO'].notna().sum()} non-null values")
+        
+        # NO usar filtro de features - usar todas las features
+        print("   - Usando TODAS las features (sin filtro IV)")
+        
+        # Predicciones para licencias con dictamen
+        if len(df_con_dictamen_pred) > 0:
+            print("   - Prediciendo licencias con dictamen...")
+            try:
+                X_con_dictamen = engineer.transform(df_con_dictamen_pred)
+                X_con_dictamen = align_features_with_model(X_con_dictamen)
+                prob_con_dictamen = trainer.predict(X_con_dictamen)  # Ya es P(TARGET_FT3=1)
+                print(f"   ✓ Predicciones completadas para {len(prob_con_dictamen):,} licencias con dictamen")
+            except Exception as e:
+                print(f"   ✗ Error al predecir licencias con dictamen: {e}")
+                raise
+        else:
+            print("   - No hay licencias con dictamen en este período")
+            prob_con_dictamen = np.array([])
+            info_con_dictamen = pd.DataFrame()  # DataFrame vacío
+        
+        # Predicciones para licencias pendientes
+        if len(df_pendientes_pred) > 0:
+            print("   - Prediciendo licencias pendientes...")
+            try:
+                # El feature engineering manejará automáticamente las columnas faltantes
+                X_pendientes = engineer.transform(df_pendientes_pred)
+                X_pendientes = align_features_with_model(X_pendientes)
+                prob_pendientes = trainer.predict(X_pendientes)  # Ya es P(TARGET_FT3=1)
+                print(f"   ✓ Predicciones completadas para {len(prob_pendientes):,} licencias pendientes")
+            except Exception as e:
+                print(f"   ✗ Error al predecir licencias pendientes: {e}")
+                print("   Intentando diagnóstico detallado...")
+                
+                # Diagnóstico del error
+                if 'feature names' in str(e).lower():
+                    print("\n   Diagnóstico: Error de coincidencia de features")
+                    print("   Verificando columnas en df_pendientes_pred:")
+                    print(f"   - Total columnas: {len(df_pendientes_pred.columns)}")
+                
+                # Verificar columnas de fecha específicas
+                fecha_cols = [c for c in df_pendientes_pred.columns if 'FECHA' in c]
+                print(f"   - Columnas de fecha encontradas: {fecha_cols}")
+                
+                # Verificar si FECHA_EMP_ENVIO está presente y tiene valores
+                if 'FECHA_EMP_ENVIO' in df_pendientes_pred.columns:
+                    print(f"   - FECHA_EMP_ENVIO presente: {df_pendientes_pred['FECHA_EMP_ENVIO'].notna().sum()} valores no nulos")
+                else:
+                    print("   - FECHA_EMP_ENVIO NO está presente")
+                
+                raise
+        else:
+            print("   - No hay licencias pendientes en este período")
+            prob_pendientes = np.array([])
+            info_pendientes = pd.DataFrame()  # DataFrame vacío
+        
+        # 4. OPTIMIZAR UMBRALES (si está habilitado)
+        if optimize_thresholds and 'TARGET_FT3' in info_con_dictamen.columns:
+            print("\n4. Optimizando umbrales basados en costos...")
+            
+            # Para optimización, podemos usar todas las licencias o solo no-FT1
+            # Usamos todas para tener una visión completa del modelo
+            mask_no_ft1 = pd.Series(True, index=info_con_dictamen.index)  # Usar todas las licencias
+            # Si quieres optimizar solo con no-FT1, descomenta la siguiente línea:
+            # mask_no_ft1 = (info_con_dictamen['LEAK_FT'] != 1) | info_con_dictamen['LEAK_FT'].isna()
+            
+            if mask_no_ft1.sum() > 0:
+                optimal_verde, optimal_amarillo, cost_analysis = optimize_thresholds_by_cost(
+                    probabilities=prob_con_dictamen[mask_no_ft1],
+                    true_labels=info_con_dictamen.loc[mask_no_ft1, 'TARGET_FT3'],
+                    dias_solicitados=info_con_dictamen.loc[mask_no_ft1, 'DIASSOLICITADO'],
+                    cost_fp_per_day=59000,
+                    cost_fn=20000,
+                    cost_manual_review=cost_manual_review,
+                    compin_reversion_rate=compin_reversion_rate
+                )
+                
+                # Comparar con umbrales fijos
+                print("\n" + "="*60)
+                print("COMPARACIÓN: UMBRALES OPTIMIZADOS vs FIJOS")
+                print("="*60)
+                
+                # Calcular costos con umbrales fijos
+                fixed_verde = 0.94  # Valor por defecto para umbral verde
+                fixed_amarillo = 0.20
+                
+                verde_mask_fixed = prob_con_dictamen[mask_no_ft1] >= fixed_verde
+                amarillo_mask_fixed = (prob_con_dictamen[mask_no_ft1] >= fixed_amarillo) & (prob_con_dictamen[mask_no_ft1] < fixed_verde)
+                rojo_mask_fixed = prob_con_dictamen[mask_no_ft1] < fixed_amarillo
+                
+                # Costos con umbrales fijos
+                verde_fp_fixed = ((verde_mask_fixed) & (info_con_dictamen.loc[mask_no_ft1, 'TARGET_FT3'] == 0)).sum()
+                if compin_reversion_rate > 0 and verde_fp_fixed > 0:
+                    dias_fp_fixed = info_con_dictamen.loc[mask_no_ft1, 'DIASSOLICITADO'][(verde_mask_fixed) & (info_con_dictamen.loc[mask_no_ft1, 'TARGET_FT3'] == 0)]
+                    verde_fp_cost_fixed = np.maximum(dias_fp_fixed * 59000 * (1 - compin_reversion_rate) - cost_manual_review, 0).sum()
+                else:
+                    verde_fp_cost_fixed = (info_con_dictamen.loc[mask_no_ft1, 'DIASSOLICITADO'][(verde_mask_fixed) & (info_con_dictamen.loc[mask_no_ft1, 'TARGET_FT3'] == 0)] * 59000).sum()
+                rojo_fn_fixed = ((rojo_mask_fixed) & (info_con_dictamen.loc[mask_no_ft1, 'TARGET_FT3'] == 1)).sum()
+                rojo_fn_cost_fixed = rojo_fn_fixed * 20000
+                amarillo_cost_fixed = amarillo_mask_fixed.sum() * cost_manual_review
+                total_cost_fixed = verde_fp_cost_fixed + rojo_fn_cost_fixed + amarillo_cost_fixed
+                
+                print(f"\nCostos con umbrales FIJOS (0.94/0.20):")
+                print(f"  - Costo total: ${total_cost_fixed:,.0f}")
+                print(f"\nCostos con umbrales OPTIMIZADOS ({optimal_verde:.2f}/{optimal_amarillo:.2f}):")
+                print(f"  - Costo total: ${cost_analysis['total_cost']:,.0f}")
+                print(f"\nAHORRO ESTIMADO: ${total_cost_fixed - cost_analysis['total_cost']:,.0f} ({(total_cost_fixed - cost_analysis['total_cost'])/total_cost_fixed*100:.1f}%)")
+                
+            else:
+                optimal_verde = 0.94  # Valor por defecto para umbral verde
+                optimal_amarillo = 0.20
+                print("\nNo hay suficientes casos no-FT1 para optimizar. Usando umbrales por defecto.")
+        else:
+            optimal_verde = 0.94  # Valor por defecto para umbral verde
+            optimal_amarillo = 0.20
+            print("\n4. Usando umbrales estándar (optimización deshabilitada o sin datos de validación)")
+        
+        # 5. ASIGNAR SEMÁFORO
+        print("\n5. Asignando clasificación por semáforo...")
+        
+        def asignar_semaforo(df_info, probs, verde_threshold=optimal_verde, amarillo_threshold=optimal_amarillo, context_label=""):
+            """Asignar semáforo basado en probabilidades y umbrales optimizados"""
+            semaforo = pd.Series('ROJO', index=df_info.index)
+
+            # Aplicar semáforo basado en probabilidades para TODAS las licencias
+            # VERDE: Alta probabilidad de aprobación
+            mask_verde = probs >= verde_threshold
+            # AMARILLO: Probabilidad media
+            mask_amarillo = (probs >= amarillo_threshold) & (probs < verde_threshold)
+            # ROJO: Baja probabilidad (ya está por defecto)
+
+            semaforo[mask_verde] = 'VERDE'
+            semaforo[mask_amarillo] = 'AMARILLO'
+
+            # Regla de negocio: licencias con más de 20 días solicitados o >=30 días acumulados no pueden quedar en verde
+            if 'DIASSOLICITADO' in df_info.columns:
+                dias_solicitados = pd.to_numeric(df_info['DIASSOLICITADO'], errors='coerce')
+            else:
+                dias_solicitados = pd.Series(np.nan, index=df_info.index)
+
+            if 'EPISODIO_ACUM_DIAS' in df_info.columns:
+                episodio_acum = pd.to_numeric(df_info['EPISODIO_ACUM_DIAS'], errors='coerce')
+            else:
+                episodio_acum = pd.Series(np.nan, index=df_info.index)
+
+            regla_negocio_mask = mask_verde & (
+                (dias_solicitados > 20) | (episodio_acum >= 30)
+            )
+
+            if regla_negocio_mask.any():
+                semaforo[regla_negocio_mask] = 'AMARILLO'
+                contexto_msg = f" ({context_label})" if context_label else ""
+                print(
+                    f"      ⚠ Regla de negocio aplicada{contexto_msg}: {regla_negocio_mask.sum():,} licencias con más de 20 días solicitados o >=30 días acumulados forzadas a AMARILLO"
+                )
+
+            # No necesitamos sufijo, LEAK_FT ya identifica las licencias FT1
+
+            return semaforo
+
+        # Aplicar clasificación con umbrales optimizados
+        if len(info_con_dictamen) > 0:
+            info_con_dictamen['PROBABILIDAD_APROBACION'] = prob_con_dictamen
+            info_con_dictamen['SEMAFORO'] = asignar_semaforo(
+                info_con_dictamen,
+                prob_con_dictamen,
+                optimal_verde,
+                optimal_amarillo,
+                context_label='licencias con dictamen'
+            )
+            info_con_dictamen['UMBRAL_VERDE'] = optimal_verde
+            info_con_dictamen['UMBRAL_AMARILLO'] = optimal_amarillo
+
+        if len(info_pendientes) > 0:
+            info_pendientes['PROBABILIDAD_APROBACION'] = prob_pendientes
+            info_pendientes['SEMAFORO'] = asignar_semaforo(
+                info_pendientes,
+                prob_pendientes,
+                optimal_verde,
+                optimal_amarillo,
+                context_label='licencias pendientes'
+            )
+            info_pendientes['UMBRAL_VERDE'] = optimal_verde
+            info_pendientes['UMBRAL_AMARILLO'] = optimal_amarillo
+        
+        # Ordenar las pendientes para Snowflake y Excel
+        if len(info_pendientes) > 0:
+            info_pendientes_sorted = info_pendientes.sort_values(
+                ['SEMAFORO', 'PROBABILIDAD_APROBACION'], 
+                ascending=[True, False]
+            )
+        else:
+            info_pendientes_sorted = info_pendientes  # DataFrame vacío
+        
+        # 6. ANÁLISIS DE RESULTADOS
+        print("\n" + "="*80)
+        print("RESUMEN DE RESULTADOS")
+        print("="*80)
+        print(f"\nUMBRALES UTILIZADOS:")
+        print(f"  - Verde (aprobación): >= {optimal_verde:.2f}")
+        print(f"  - Amarillo (revisión): {optimal_amarillo:.2f} - {optimal_verde:.2f}")
+        print(f"  - Rojo (rechazo): < {optimal_amarillo:.2f}")
+        
+        total_licencias = len(info_con_dictamen) + len(info_pendientes)
+        print(f"\nTOTAL LICENCIAS PROCESADAS: {total_licencias:,}")
+        print(f"  - Con dictamen: {len(info_con_dictamen):,}")
+        print(f"  - Pendientes: {len(info_pendientes):,}")
+        
+        # Validación con licencias con dictamen
+        print("\n\nA. VALIDACIÓN DEL MODELO (licencias con dictamen):")
+        print("-" * 50)
+        
+        if len(info_con_dictamen) > 0:
+            # Contar valores de semáforo
+            for sem in ['VERDE', 'AMARILLO', 'ROJO']:
+                n = (info_con_dictamen['SEMAFORO'] == sem).sum()
+                if n > 0:
+                    pct = n / len(info_con_dictamen) * 100
+                    print(f"  {sem}: {n:,} ({pct:.1f}%)")
+            
+            # Mostrar información adicional de FT1
+            if 'LEAK_FT' in info_con_dictamen.columns:
+                ft1_count = (info_con_dictamen['LEAK_FT'] == 1).sum()
+                if ft1_count > 0:
+                    print(f"\n  Licencias que pasaron por FT1: {ft1_count:,}")
+                    # Análisis de match con FT1
+                    ft1_licencias = info_con_dictamen[info_con_dictamen['LEAK_FT'] == 1]
+                    verde_ft1 = (ft1_licencias['SEMAFORO'] == 'VERDE').sum()
+                    print(f"    - FT1 → Verde FT3: {verde_ft1:,} ({verde_ft1/ft1_count*100:.1f}%)")
+                    amarillo_ft1 = (ft1_licencias['SEMAFORO'] == 'AMARILLO').sum()
+                    if amarillo_ft1 > 0:
+                        print(f"    - FT1 → Amarillo FT3: {amarillo_ft1:,} ({amarillo_ft1/ft1_count*100:.1f}%)")
+                    rojo_ft1 = (ft1_licencias['SEMAFORO'] == 'ROJO').sum()
+                    if rojo_ft1 > 0:
+                        print(f"    - FT1 → Rojo FT3: {rojo_ft1:,} ({rojo_ft1/ft1_count*100:.1f}%)")
+        else:
+            print("  No hay licencias con dictamen en este período")
+        
+        # Métricas zona verde
+        if len(info_con_dictamen) > 0 and 'SEMAFORO' in info_con_dictamen.columns:
+            verde_con_dictamen = info_con_dictamen[info_con_dictamen['SEMAFORO'] == 'VERDE']
+        else:
+            verde_con_dictamen = pd.DataFrame()
+        
+        if len(verde_con_dictamen) > 0:
+            tp = (verde_con_dictamen['TARGET_FT3'] == 1).sum()
+            fp = (verde_con_dictamen['TARGET_FT3'] == 0).sum()
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            
+            print(f"\nMétricas Zona VERDE:")
+            print(f"  Total: {len(verde_con_dictamen):,}")
+            print(f"  Precisión: {precision:.1%}")
+            print(f"  - Verdaderos positivos: {tp:,}")
+            print(f"  - Falsos positivos: {fp:,}")
+            
+        # Predicciones para pendientes
+        print("\n\nB. PREDICCIONES PARA LICENCIAS PENDIENTES:")
+        print("-" * 50)
+        print(f"Total pendientes: {len(info_pendientes):,}")
+        
+        # Contar valores de semáforo
+        for sem in ['VERDE', 'AMARILLO', 'ROJO']:
+            n = (info_pendientes['SEMAFORO'] == sem).sum()
+            if n > 0:
+                pct = n / len(info_pendientes) * 100
+                print(f"  {sem}: {n:,} ({pct:.1f}%)")
+        
+        # Detalle zona verde pendientes
+        verde_pendientes = info_pendientes[info_pendientes['SEMAFORO'] == 'VERDE']
+        if len(verde_pendientes) > 0:
+            print(f"\nRecomendadas para aprobación (VERDE): {len(verde_pendientes):,}")
+            print(f"Días solicitados totales: {verde_pendientes['DIASSOLICITADO'].sum():,}")
+            
+            print("\nTop 10 diagnósticos en zona VERDE:")
+            for i, (cie, count) in enumerate(verde_pendientes['CIE_GRUPO'].value_counts().head(10).items(), 1):
+                pct = count / len(verde_pendientes) * 100
+                print(f"  {i:2d}. {cie}: {count:,} ({pct:.1f}%)")
+        
+        # 7. GUARDAR RESULTADOS EN SNOWFLAKE
+        print("\n\n7. Guardando predicciones en Snowflake...")
+        
+        # Generar timestamp para el archivo Excel
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        fecha_procesamiento = datetime.now()
+        
+        # Guardar predicciones diarias (todas: con dictamen y pendientes)
+        try:
+            from snowflake.connector.pandas_tools import write_pandas
+            
+            # 7.1 GUARDAR PREDICCIONES DIARIAS (TODAS)
+            print("   A. Guardando predicciones diarias (todas las licencias)...")
+
+            # Combinar todas las predicciones
+            all_predictions = pd.concat([info_con_dictamen, info_pendientes], ignore_index=True)
+
+            # Preparar para Snowflake replicando estructura de FT3_dia
+            df_daily = all_predictions.copy()
+            df_daily['FECHA_PROCESAMIENTO'] = fecha_procesamiento
+            df_daily['FECHA_DESDE'] = date_from
+            df_daily['FECHA_HASTA'] = date_to
+            df_daily['MODELO_VERSION'] = 'FT30'
+            df_daily['ES_PENDIENTE'] = df_daily['LCC_COMCOR'].isin(info_pendientes['LCC_COMCOR']).astype(int)
+
+            if operador_map is not None and 'LCC_COMCOR' in df_daily.columns:
+                if 'LCC_OPERADOR' not in df_daily.columns:
+                    df_daily['LCC_OPERADOR'] = pd.Series([None] * len(df_daily), index=df_daily.index)
+                df_daily['LCC_OPERADOR'] = df_daily['LCC_OPERADOR'].where(
+                    df_daily['LCC_OPERADOR'].notna(),
+                    df_daily['LCC_COMCOR'].map(operador_map)
+                )
+
+            tabla_diaria = "FT30_PREDICCIONES_DIARIAS"
+            cursor = loader.conn.cursor()
+
+            create_daily_table = f"""
+            CREATE TABLE IF NOT EXISTS {tabla_diaria} (
+                AFILIADO_RUT VARCHAR(11),
+                LCC_COMCOD NUMBER(38,0),
+                LCC_COMCOR NUMBER(38,0),
+                LCC_OPERADOR NUMBER(38,0),
+                LCC_MEDRUT VARCHAR(11),
+                LCC_EMPRUT VARCHAR(11),
+                LCC_IDN VARCHAR(20),
+                EPISODIO_ACUM_DIAS NUMBER(38,0),
+                EPISODIO_FEC_INI DATE,
+                CONTINUA_CALC VARCHAR(1),
+                TIPO_F_LM_COD NUMBER(38,0),
+                TIPO_F_LM VARCHAR(35),
+                FECHA_RECEPCION TIMESTAMP_NTZ(3),
+                FECHA_INICIO TIMESTAMP_NTZ(3),
+                FECHA_TERMINO TIMESTAMP_NTZ(3),
+                DIASSOLICITADO NUMBER(38,0),
+                CIE_F VARCHAR(120),
+                CIE_F_COD VARCHAR(12),
+                CIE_GRUPO VARCHAR(30),
+                LM_DIAGNOSTICO VARCHAR(100),
+                LM_ANTECEDENTES_CLINICOS VARCHAR(100),
+                COT_EDAD NUMBER(38,0),
+                COT_GENERO VARCHAR(4),
+                RENTA_ESTIMADA FLOAT,
+                SEMAFORO VARCHAR(20),
+                PROBABILIDAD_APROBACION FLOAT,
+                UMBRAL_VERDE FLOAT,
+                UMBRAL_AMARILLO FLOAT,
+                FECHA_PROCESAMIENTO TIMESTAMP_NTZ,
+                FECHA_DESDE DATE,
+                FECHA_HASTA DATE,
+                MODELO_VERSION VARCHAR(10),
+                ES_PENDIENTE NUMBER(1,0),
+                TARGET_FT3 NUMBER(1,0),
+                TARGET_APRUEBA NUMBER(1,0),
+                GLOSA_GENERADA VARCHAR(500),
+                CAUSAL_GENERADA VARCHAR(100),
+                LEAK_FT VARCHAR(100),
+                LEAK_CAUSALES VARCHAR(500),
+                LEAK_DIASAUTORIZADOS NUMBER(38,0),
+                LEAK_GLOSAS VARCHAR(500),
+                LEAK_ESTADOLM VARCHAR(35),
+                LEAK_FALLO_PE VARCHAR(255)
+            )
+            """
+
+            cursor.execute(create_daily_table)
+            # Asegurar que columnas nuevas existan aunque la tabla venga de versiones previas
+            required_columns_daily = [
+                ("AFILIADO_RUT", "VARCHAR(11)"),
+                ("LCC_COMCOD", "NUMBER(38,0)"),
+                ("LCC_COMCOR", "NUMBER(38,0)"),
+                ("LCC_OPERADOR", "NUMBER(38,0)"),
+                ("LCC_MEDRUT", "VARCHAR(11)"),
+                ("LCC_EMPRUT", "VARCHAR(11)"),
+                ("LCC_IDN", "VARCHAR(20)"),
+                ("EPISODIO_ACUM_DIAS", "NUMBER(38,0)"),
+                ("EPISODIO_FEC_INI", "DATE"),
+                ("CONTINUA_CALC", "VARCHAR(1)"),
+                ("TIPO_F_LM_COD", "NUMBER(38,0)"),
+                ("TIPO_F_LM", "VARCHAR(35)"),
+                ("FECHA_RECEPCION", "TIMESTAMP_NTZ(3)"),
+                ("FECHA_INICIO", "TIMESTAMP_NTZ(3)"),
+                ("FECHA_TERMINO", "TIMESTAMP_NTZ(3)"),
+                ("DIASSOLICITADO", "NUMBER(38,0)"),
+                ("CIE_F", "VARCHAR(120)"),
+                ("CIE_F_COD", "VARCHAR(12)"),
+                ("CIE_GRUPO", "VARCHAR(30)"),
+                ("LM_DIAGNOSTICO", "VARCHAR(100)"),
+                ("LM_ANTECEDENTES_CLINICOS", "VARCHAR(100)"),
+                ("COT_EDAD", "NUMBER(38,0)"),
+                ("COT_GENERO", "VARCHAR(4)"),
+                ("RENTA_ESTIMADA", "FLOAT"),
+                ("SEMAFORO", "VARCHAR(20)"),
+                ("PROBABILIDAD_APROBACION", "FLOAT"),
+                ("UMBRAL_VERDE", "FLOAT"),
+                ("UMBRAL_AMARILLO", "FLOAT"),
+                ("FECHA_PROCESAMIENTO", "TIMESTAMP_NTZ"),
+                ("FECHA_DESDE", "DATE"),
+                ("FECHA_HASTA", "DATE"),
+                ("MODELO_VERSION", "VARCHAR(10)"),
+                ("ES_PENDIENTE", "NUMBER(1,0)"),
+                ("TARGET_FT3", "NUMBER(1,0)"),
+                ("TARGET_APRUEBA", "NUMBER(1,0)"),
+                ("GLOSA_GENERADA", "VARCHAR(500)"),
+                ("CAUSAL_GENERADA", "VARCHAR(100)"),
+                ("LEAK_FT", "VARCHAR(100)"),
+                ("LEAK_CAUSALES", "VARCHAR(500)"),
+                ("LEAK_DIASAUTORIZADOS", "NUMBER(38,0)"),
+                ("LEAK_GLOSAS", "VARCHAR(500)"),
+                ("LEAK_ESTADOLM", "VARCHAR(35)"),
+                ("LEAK_FALLO_PE", "VARCHAR(255)")
+            ]
+            for column_name, column_type in required_columns_daily:
+                cursor.execute(
+                    f"ALTER TABLE {tabla_diaria} ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                )
+            print(f"      ✓ Tabla {tabla_diaria} creada/verificada")
+
+            tabla_temp = f"{tabla_diaria}_TEMP"
+            cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp}")
+            cursor.execute(f"CREATE TEMPORARY TABLE {tabla_temp} LIKE {tabla_diaria}")
+            print(f"      ✓ Tabla temporal {tabla_temp} creada")
+
+            df_daily['GLOSA_GENERADA'] = ''
+            df_daily['CAUSAL_GENERADA'] = ''
+
+            df_daily.loc[df_daily['SEMAFORO'] == 'VERDE', 'GLOSA_GENERADA'] = 'Licencia aprobada automáticamente por modelo predictivo'
+            df_daily.loc[df_daily['SEMAFORO'] == 'AMARILLO', 'GLOSA_GENERADA'] = 'Licencia requiere revisión manual'
+            df_daily.loc[df_daily['SEMAFORO'] == 'ROJO', 'GLOSA_GENERADA'] = 'Licencia rechazada automáticamente por modelo predictivo'
+
+            # Normalizar nombres de columna para prevenir identificadores inválidos en Snowflake
+            df_daily.columns = df_daily.columns.astype(str).str.strip().str.upper()
+
+            # Asegurar columnas clave antes de mapear
+            for base_col in ['LCC_MEDRUT', 'LCC_EMPRUT', 'LCC_IDN', 'LCC_OPERADOR', 'COT_EDAD', 'COT_GENERO', 'RENTA_ESTIMADA']:
+                if base_col not in df_daily.columns:
+                    df_daily[base_col] = pd.Series([None] * len(df_daily), index=df_daily.index)
+
+            # Fallbacks para rut del médico
+            if 'PRESTADOR_RUT' in df_daily.columns:
+                df_daily['LCC_MEDRUT'] = df_daily['LCC_MEDRUT'].where(df_daily['LCC_MEDRUT'].notna(), df_daily['PRESTADOR_RUT'])
+            if 'PRESTADOR_LOCAL_RUT' in df_daily.columns:
+                df_daily['LCC_MEDRUT'] = df_daily['LCC_MEDRUT'].where(df_daily['LCC_MEDRUT'].notna(), df_daily['PRESTADOR_LOCAL_RUT'])
+
+            # Fallback para rut del empleador
+            if 'EMPLEADOR_RUT' in df_daily.columns:
+                df_daily['LCC_EMPRUT'] = df_daily['LCC_EMPRUT'].where(df_daily['LCC_EMPRUT'].notna(), df_daily['EMPLEADOR_RUT'])
+
+            # Fallback para identificador de licencia
+            if 'N_LICENCIA' in df_daily.columns:
+                df_daily['LCC_IDN'] = df_daily['LCC_IDN'].where(df_daily['LCC_IDN'].notna(), df_daily['N_LICENCIA'])
+
+            if 'COT_EDAD' in df_daily.columns:
+                cot_edad_numeric = pd.to_numeric(df_daily['COT_EDAD'], errors='coerce')
+                cot_edad_numeric = cot_edad_numeric.round()
+                df_daily['COT_EDAD'] = cot_edad_numeric.apply(lambda v: int(v) if not pd.isna(v) else None)
+
+            if 'LCC_OPERADOR' in df_daily.columns:
+                lcc_operador_numeric = pd.to_numeric(df_daily['LCC_OPERADOR'], errors='coerce')
+                df_daily['LCC_OPERADOR'] = lcc_operador_numeric.apply(lambda v: int(v) if not pd.isna(v) else None)
+
+            leak_columns_list = ['LEAK_FT', 'LEAK_CAUSALES', 'LEAK_DIASAUTORIZADOS', 'LEAK_GLOSAS', 'LEAK_ESTADOLM', 'LEAK_FALLO_PE']
+            for col in leak_columns_list:
+                if col not in df_daily.columns:
+                    df_daily[col] = pd.Series([None] * len(df_daily), index=df_daily.index)
+
+            base_columns = [
+                'AFILIADO_RUT', 'LCC_COMCOD', 'LCC_COMCOR', 'LCC_OPERADOR', 'LCC_MEDRUT', 'LCC_EMPRUT',
+                'LCC_IDN', 'EPISODIO_ACUM_DIAS', 'EPISODIO_FEC_INI', 'CONTINUA_CALC', 'TIPO_F_LM_COD', 'TIPO_F_LM',
+                'FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'DIASSOLICITADO', 'CIE_F', 'CIE_F_COD',
+                'CIE_GRUPO', 'LM_DIAGNOSTICO', 'LM_ANTECEDENTES_CLINICOS', 'COT_EDAD', 'COT_GENERO', 'RENTA_ESTIMADA'
+            ]
+
+            model_columns = [
+                'SEMAFORO', 'PROBABILIDAD_APROBACION', 'UMBRAL_VERDE', 'UMBRAL_AMARILLO',
+                'FECHA_PROCESAMIENTO', 'FECHA_DESDE', 'FECHA_HASTA', 'MODELO_VERSION',
+                'ES_PENDIENTE', 'TARGET_FT3', 'TARGET_APRUEBA', 'GLOSA_GENERADA', 'CAUSAL_GENERADA'
+            ]
+
+            leak_columns = leak_columns_list
+
+            columns_to_save = []
+            for col in base_columns + model_columns + leak_columns:
+                if col not in df_daily.columns:
+                    df_daily[col] = pd.Series([None] * len(df_daily), index=df_daily.index)
+                columns_to_save.append(col)
+
+            if 'CIE_GRUPO' in df_daily.columns:
+                df_daily['CIE_GRUPO'] = df_daily['CIE_GRUPO'].astype(str).str[:30]
+            if 'CIE_F' in df_daily.columns:
+                df_daily['CIE_F'] = df_daily['CIE_F'].astype(str).str[:120]
+            if 'GLOSA_GENERADA' in df_daily.columns:
+                df_daily['GLOSA_GENERADA'] = df_daily['GLOSA_GENERADA'].astype(str).str[:500]
+            if 'CAUSAL_GENERADA' in df_daily.columns:
+                df_daily['CAUSAL_GENERADA'] = df_daily['CAUSAL_GENERADA'].astype(str).str[:100]
+
+            date_columns = ['FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'EPISODIO_FEC_INI',
+                            'FECHA_PROCESAMIENTO', 'FECHA_DESDE', 'FECHA_HASTA']
+            for col in date_columns:
+                if col in df_daily.columns:
+                    df_daily[col] = pd.to_datetime(df_daily[col], errors='coerce')
+                    df_daily[col] = df_daily[col].dt.strftime('%Y-%m-%d %H:%M:%S').where(pd.notnull(df_daily[col]), None)
+
+            df_to_save = df_daily[columns_to_save].copy()
+
+            success, nchunks, nrows, _ = write_pandas(
+                conn=loader.conn,
+                df=df_to_save,
+                table_name=tabla_temp,
+                database=loader.connection_params['database'],
+                schema=loader.connection_params['schema'],
+                quote_identifiers=False,
+                auto_create_table=False,
+                overwrite=False
+            )
+            
+            if success:
+                print(f"      ✓ {nrows:,} registros cargados en tabla temporal")
+                
+                merge_query = f"""
+                MERGE INTO {tabla_diaria} AS target
+                USING {tabla_temp} AS source
+                ON target.AFILIADO_RUT = source.AFILIADO_RUT 
+                   AND target.LCC_COMCOR = source.LCC_COMCOR
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        LCC_COMCOD = source.LCC_COMCOD,
+                        LCC_OPERADOR = source.LCC_OPERADOR,
+                        LCC_MEDRUT = source.LCC_MEDRUT,
+                        LCC_EMPRUT = source.LCC_EMPRUT,
+                        LCC_IDN = source.LCC_IDN,
+                        EPISODIO_ACUM_DIAS = source.EPISODIO_ACUM_DIAS,
+                        EPISODIO_FEC_INI = source.EPISODIO_FEC_INI,
+                        CONTINUA_CALC = source.CONTINUA_CALC,
+                        TIPO_F_LM_COD = source.TIPO_F_LM_COD,
+                        TIPO_F_LM = source.TIPO_F_LM,
+                        FECHA_RECEPCION = source.FECHA_RECEPCION,
+                        FECHA_INICIO = source.FECHA_INICIO,
+                        FECHA_TERMINO = source.FECHA_TERMINO,
+                        DIASSOLICITADO = source.DIASSOLICITADO,
+                        CIE_F = source.CIE_F,
+                        CIE_F_COD = source.CIE_F_COD,
+                        CIE_GRUPO = source.CIE_GRUPO,
+                        LM_DIAGNOSTICO = source.LM_DIAGNOSTICO,
+                        LM_ANTECEDENTES_CLINICOS = source.LM_ANTECEDENTES_CLINICOS,
+                        COT_EDAD = source.COT_EDAD,
+                        COT_GENERO = source.COT_GENERO,
+                        RENTA_ESTIMADA = source.RENTA_ESTIMADA,
+                        SEMAFORO = COALESCE(target.SEMAFORO, source.SEMAFORO),
+                        PROBABILIDAD_APROBACION = COALESCE(target.PROBABILIDAD_APROBACION, source.PROBABILIDAD_APROBACION),
+                        UMBRAL_VERDE = COALESCE(target.UMBRAL_VERDE, source.UMBRAL_VERDE),
+                        UMBRAL_AMARILLO = COALESCE(target.UMBRAL_AMARILLO, source.UMBRAL_AMARILLO),
+                        FECHA_PROCESAMIENTO = COALESCE(target.FECHA_PROCESAMIENTO, source.FECHA_PROCESAMIENTO),
+                        FECHA_DESDE = COALESCE(target.FECHA_DESDE, source.FECHA_DESDE),
+                        FECHA_HASTA = COALESCE(target.FECHA_HASTA, source.FECHA_HASTA),
+                        MODELO_VERSION = COALESCE(target.MODELO_VERSION, source.MODELO_VERSION),
+                        ES_PENDIENTE = source.ES_PENDIENTE,
+                        TARGET_FT3 = source.TARGET_FT3,
+                        TARGET_APRUEBA = source.TARGET_APRUEBA,
+                        GLOSA_GENERADA = COALESCE(target.GLOSA_GENERADA, source.GLOSA_GENERADA),
+                        CAUSAL_GENERADA = COALESCE(target.CAUSAL_GENERADA, source.CAUSAL_GENERADA),
+                        LEAK_FT = source.LEAK_FT,
+                        LEAK_CAUSALES = source.LEAK_CAUSALES,
+                        LEAK_DIASAUTORIZADOS = source.LEAK_DIASAUTORIZADOS,
+                        LEAK_GLOSAS = source.LEAK_GLOSAS,
+                        LEAK_ESTADOLM = source.LEAK_ESTADOLM,
+                        LEAK_FALLO_PE = source.LEAK_FALLO_PE
+                WHEN NOT MATCHED THEN
+                    INSERT (AFILIADO_RUT, LCC_COMCOD, LCC_COMCOR, LCC_OPERADOR,
+                           LCC_MEDRUT, LCC_EMPRUT, LCC_IDN,
+                           EPISODIO_ACUM_DIAS, EPISODIO_FEC_INI, CONTINUA_CALC,
+                           TIPO_F_LM_COD, TIPO_F_LM,
+                           FECHA_RECEPCION, FECHA_INICIO, FECHA_TERMINO, DIASSOLICITADO,
+                           CIE_F, CIE_F_COD, CIE_GRUPO, LM_DIAGNOSTICO, LM_ANTECEDENTES_CLINICOS,
+                           COT_EDAD, COT_GENERO, RENTA_ESTIMADA,
+                           SEMAFORO, PROBABILIDAD_APROBACION, UMBRAL_VERDE, UMBRAL_AMARILLO,
+                           FECHA_PROCESAMIENTO, FECHA_DESDE, FECHA_HASTA, MODELO_VERSION,
+                           ES_PENDIENTE, TARGET_FT3, TARGET_APRUEBA,
+                           GLOSA_GENERADA, CAUSAL_GENERADA,
+                           LEAK_FT, LEAK_CAUSALES, LEAK_DIASAUTORIZADOS,
+                           LEAK_GLOSAS, LEAK_ESTADOLM, LEAK_FALLO_PE)
+                    VALUES (source.AFILIADO_RUT, source.LCC_COMCOD, source.LCC_COMCOR, source.LCC_OPERADOR,
+                           source.LCC_MEDRUT, source.LCC_EMPRUT, source.LCC_IDN,
+                           source.EPISODIO_ACUM_DIAS, source.EPISODIO_FEC_INI, source.CONTINUA_CALC,
+                           source.TIPO_F_LM_COD, source.TIPO_F_LM,
+                           source.FECHA_RECEPCION, source.FECHA_INICIO, source.FECHA_TERMINO, source.DIASSOLICITADO,
+                           source.CIE_F, source.CIE_F_COD, source.CIE_GRUPO, source.LM_DIAGNOSTICO, source.LM_ANTECEDENTES_CLINICOS,
+                           source.COT_EDAD, source.COT_GENERO, source.RENTA_ESTIMADA,
+                           source.SEMAFORO, source.PROBABILIDAD_APROBACION, source.UMBRAL_VERDE, source.UMBRAL_AMARILLO,
+                           source.FECHA_PROCESAMIENTO, source.FECHA_DESDE, source.FECHA_HASTA, source.MODELO_VERSION,
+                           source.ES_PENDIENTE, source.TARGET_FT3, source.TARGET_APRUEBA,
+                           source.GLOSA_GENERADA, source.CAUSAL_GENERADA,
+                           source.LEAK_FT, source.LEAK_CAUSALES, source.LEAK_DIASAUTORIZADOS,
+                           source.LEAK_GLOSAS, source.LEAK_ESTADOLM, source.LEAK_FALLO_PE)
+                """
+                
+                cursor.execute(merge_query)
+                merge_count = cursor.rowcount
+                print(f"      ✓ MERGE completado: {merge_count} registros afectados")
+                
+                # Limpiar tabla temporal
+                cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp}")
+                
+                # Verificar inserción
+                verify_query = f"""
+                SELECT COUNT(*) as total,
+                       SUM(ES_PENDIENTE) as pendientes,
+                       COUNT(DISTINCT SEMAFORO) as semaforos
+                FROM {tabla_diaria}
+                WHERE DATE(FECHA_PROCESAMIENTO) = CURRENT_DATE()
+                """
+                cursor.execute(verify_query)
+                result = cursor.fetchone()
+                if result:
+                    total_count = result[0] if result[0] is not None else 0
+                    pending_count = int(result[1]) if result[1] is not None else 0
+                    semaforos_count = result[2] if result[2] is not None else 0
+                    print(f"      ✓ Verificación: {total_count:,} total, {pending_count:,} pendientes, {semaforos_count} semáforos")
+            
+            # 7.2 GUARDAR TAMBIÉN LICENCIAS PENDIENTES EN TABLA SEPARADA (compatibilidad)
+            print("\n   B. Guardando licencias pendientes en tabla separada...")
+            
+            # Preparar datos para Snowflake - solo licencias pendientes
+            df_snowflake_pendientes = info_pendientes_sorted.copy()
+
+            if operador_map is not None and 'LCC_COMCOR' in df_snowflake_pendientes.columns:
+                df_snowflake_pendientes['LCC_OPERADOR'] = df_snowflake_pendientes.get('LCC_OPERADOR')
+                df_snowflake_pendientes['LCC_OPERADOR'] = df_snowflake_pendientes['LCC_OPERADOR'].where(
+                    df_snowflake_pendientes['LCC_OPERADOR'].notna(),
+                    df_snowflake_pendientes['LCC_COMCOR'].map(operador_map)
+                )
+
+            # IMPORTANTE: Asegurar que LCC_COMCOR sea string ANTES de cualquier procesamiento
+            df_snowflake_pendientes['LCC_COMCOR'] = df_snowflake_pendientes['LCC_COMCOR'].astype(str)
+
+            # Agregar columna de fecha de procesamiento
+            df_snowflake_pendientes['FECHA_PROCESAMIENTO'] = fecha_procesamiento
+            df_snowflake_pendientes['FECHA_PROCESAMIENTO_STR'] = fecha_procesamiento.strftime('%Y-%m-%d %H:%M:%S')
+
+            # Convertir campos de fecha a formato string ISO para Snowflake
+            df_snowflake_pendientes['MODELO_VERSION'] = 'FT30'
+            date_columns = ['FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'EPISODIO_FEC_INI', 'FECHA_PROCESAMIENTO']
+            for col in date_columns:
+                if col in df_snowflake_pendientes.columns:
+                    df_snowflake_pendientes[col] = pd.to_datetime(df_snowflake_pendientes[col], errors='coerce')
+                    df_snowflake_pendientes[col] = df_snowflake_pendientes[col].dt.strftime('%Y-%m-%d %H:%M:%S').where(
+                        pd.notnull(df_snowflake_pendientes[col]), None
+                    )
+
+            df_snowflake_pendientes.columns = df_snowflake_pendientes.columns.astype(str).str.strip().str.upper()
+
+            for base_col in ['LCC_MEDRUT', 'LCC_EMPRUT', 'LCC_IDN', 'LCC_OPERADOR']:
+                if base_col not in df_snowflake_pendientes.columns:
+                    df_snowflake_pendientes[base_col] = pd.Series([None] * len(df_snowflake_pendientes), index=df_snowflake_pendientes.index)
+
+            if 'PRESTADOR_RUT' in df_snowflake_pendientes.columns:
+                df_snowflake_pendientes['LCC_MEDRUT'] = df_snowflake_pendientes['LCC_MEDRUT'].where(
+                    df_snowflake_pendientes['LCC_MEDRUT'].notna(), df_snowflake_pendientes['PRESTADOR_RUT']
+                )
+            if 'PRESTADOR_LOCAL_RUT' in df_snowflake_pendientes.columns:
+                df_snowflake_pendientes['LCC_MEDRUT'] = df_snowflake_pendientes['LCC_MEDRUT'].where(
+                    df_snowflake_pendientes['LCC_MEDRUT'].notna(), df_snowflake_pendientes['PRESTADOR_LOCAL_RUT']
+                )
+
+            if 'EMPLEADOR_RUT' in df_snowflake_pendientes.columns:
+                df_snowflake_pendientes['LCC_EMPRUT'] = df_snowflake_pendientes['LCC_EMPRUT'].where(
+                    df_snowflake_pendientes['LCC_EMPRUT'].notna(), df_snowflake_pendientes['EMPLEADOR_RUT']
+                )
+
+            if 'N_LICENCIA' in df_snowflake_pendientes.columns:
+                df_snowflake_pendientes['LCC_IDN'] = df_snowflake_pendientes['LCC_IDN'].where(
+                    df_snowflake_pendientes['LCC_IDN'].notna(), df_snowflake_pendientes['N_LICENCIA']
+                )
+
+            if 'COT_EDAD' in df_snowflake_pendientes.columns:
+                cot_edad_pending = pd.to_numeric(df_snowflake_pendientes['COT_EDAD'], errors='coerce')
+                cot_edad_pending = cot_edad_pending.round()
+                df_snowflake_pendientes['COT_EDAD'] = cot_edad_pending.apply(
+                    lambda v: int(v) if not pd.isna(v) else None
+                )
+
+            if 'LCC_OPERADOR' in df_snowflake_pendientes.columns:
+                lcc_operador_pending = pd.to_numeric(df_snowflake_pendientes['LCC_OPERADOR'], errors='coerce')
+                df_snowflake_pendientes['LCC_OPERADOR'] = lcc_operador_pending.apply(
+                    lambda v: int(v) if not pd.isna(v) else None
+                )
+            
+            # Nombre de la tabla fija (sin timestamp)
+            tabla_pendientes = "FT30_LICENCIAS_PENDIENTES"
+            
+            # Verificar si la tabla existe y obtener licencias ya procesadas
+            cursor = loader.conn.cursor()
+            
+            # Verificar si la tabla existe
+            cursor.execute(f"SHOW TABLES LIKE '{tabla_pendientes}'")
+            table_exists = cursor.fetchone() is not None
+            
+            if not table_exists:
+                # Si la tabla no existe, crearla con el schema correcto
+                print(f"   - Creando tabla {tabla_pendientes} por primera vez...")
+                create_pendientes_table = f"""
+                CREATE TABLE {tabla_pendientes} (
+                    AFILIADO_RUT VARCHAR(11),
+                    LCC_COMCOD NUMBER(38,0),
+                    LCC_COMCOR NUMBER(38,0),
+                    LCC_OPERADOR NUMBER(38,0),
+                    LCC_MEDRUT VARCHAR(11),
+                    LCC_EMPRUT VARCHAR(11),
+                    LCC_IDN VARCHAR(20),
+                    EPISODIO_ACUM_DIAS NUMBER(38,0),
+                    EPISODIO_FEC_INI DATE,
+                    CONTINUA_CALC VARCHAR(1),
+                    TIPO_F_LM_COD NUMBER(38,0),
+                    TIPO_F_LM VARCHAR(35),
+                    FECHA_RECEPCION TIMESTAMP_NTZ(3),
+                    FECHA_INICIO TIMESTAMP_NTZ(3),
+                    FECHA_TERMINO TIMESTAMP_NTZ(3),
+                    DIASSOLICITADO NUMBER(38,0),
+                    CIE_F VARCHAR(120),
+                    CIE_F_COD VARCHAR(12),
+                    CIE_GRUPO VARCHAR(30),
+                    LM_DIAGNOSTICO VARCHAR(100),
+                    LM_ANTECEDENTES_CLINICOS VARCHAR(100),
+                    COT_EDAD NUMBER(38,0),
+                    COT_GENERO VARCHAR(4),
+                    RENTA_ESTIMADA FLOAT,
+                    SEMAFORO VARCHAR(20),
+                    PROBABILIDAD_APROBACION FLOAT,
+                    UMBRAL_VERDE FLOAT,
+                    UMBRAL_AMARILLO FLOAT,
+                    FECHA_PROCESAMIENTO TIMESTAMP_NTZ,
+                    FECHA_PROCESAMIENTO_STR VARCHAR(50),
+                    MODELO_VERSION VARCHAR(10),
+                    TARGET_FT3 NUMBER(1,0),
+                    TARGET_APRUEBA NUMBER(1,0),
+                    GLOSA_GENERADA VARCHAR(500),
+                    CAUSAL_GENERADA VARCHAR(100),
+                    LEAK_FT VARCHAR(100),
+                    LEAK_CAUSALES VARCHAR(500),
+                    LEAK_DIASAUTORIZADOS NUMBER(38,0),
+                    LEAK_GLOSAS VARCHAR(500),
+                    LEAK_ESTADOLM VARCHAR(35),
+                    LEAK_FALLO_PE VARCHAR(255)
+                )
+                """
+                cursor.execute(create_pendientes_table)
+                print(f"      ✓ Tabla {tabla_pendientes} creada")
+            else:
+                required_columns_pendiente_defs = [
+                    ("AFILIADO_RUT", "VARCHAR(11)"),
+                    ("LCC_COMCOD", "NUMBER(38,0)"),
+                    ("LCC_COMCOR", "NUMBER(38,0)"),
+                    ("LCC_OPERADOR", "NUMBER(38,0)"),
+                    ("LCC_MEDRUT", "VARCHAR(11)"),
+                    ("LCC_EMPRUT", "VARCHAR(11)"),
+                    ("LCC_IDN", "VARCHAR(20)"),
+                    ("EPISODIO_ACUM_DIAS", "NUMBER(38,0)"),
+                    ("EPISODIO_FEC_INI", "DATE"),
+                    ("CONTINUA_CALC", "VARCHAR(1)"),
+                    ("TIPO_F_LM_COD", "NUMBER(38,0)"),
+                    ("TIPO_F_LM", "VARCHAR(35)"),
+                    ("FECHA_RECEPCION", "TIMESTAMP_NTZ(3)"),
+                    ("FECHA_INICIO", "TIMESTAMP_NTZ(3)"),
+                    ("FECHA_TERMINO", "TIMESTAMP_NTZ(3)"),
+                    ("DIASSOLICITADO", "NUMBER(38,0)"),
+                    ("CIE_F", "VARCHAR(120)"),
+                    ("CIE_F_COD", "VARCHAR(12)"),
+                    ("CIE_GRUPO", "VARCHAR(30)"),
+                    ("LM_DIAGNOSTICO", "VARCHAR(100)"),
+                    ("LM_ANTECEDENTES_CLINICOS", "VARCHAR(100)"),
+                    ("COT_EDAD", "NUMBER(38,0)"),
+                    ("COT_GENERO", "VARCHAR(4)"),
+                    ("RENTA_ESTIMADA", "FLOAT"),
+                    ("SEMAFORO", "VARCHAR(20)"),
+                    ("PROBABILIDAD_APROBACION", "FLOAT"),
+                    ("UMBRAL_VERDE", "FLOAT"),
+                    ("UMBRAL_AMARILLO", "FLOAT"),
+                    ("FECHA_PROCESAMIENTO", "TIMESTAMP_NTZ"),
+                    ("FECHA_PROCESAMIENTO_STR", "VARCHAR(50)"),
+                    ("MODELO_VERSION", "VARCHAR(10)"),
+                    ("TARGET_FT3", "NUMBER(1,0)"),
+                    ("TARGET_APRUEBA", "NUMBER(1,0)"),
+                    ("GLOSA_GENERADA", "VARCHAR(500)"),
+                    ("CAUSAL_GENERADA", "VARCHAR(100)"),
+                    ("LEAK_FT", "VARCHAR(100)"),
+                    ("LEAK_CAUSALES", "VARCHAR(500)"),
+                    ("LEAK_DIASAUTORIZADOS", "NUMBER(38,0)"),
+                    ("LEAK_GLOSAS", "VARCHAR(500)"),
+                    ("LEAK_ESTADOLM", "VARCHAR(35)"),
+                    ("LEAK_FALLO_PE", "VARCHAR(255)")
+                ]
+                for column_name, column_type in required_columns_pendiente_defs:
+                    cursor.execute(
+                        f"ALTER TABLE {tabla_pendientes} ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                    )
+                print(f"   - Tabla {tabla_pendientes} ya existía (schema actualizado)")
+
+            # Crear tabla temporal para MERGE de pendientes
+            tabla_temp_pend = f"{tabla_pendientes}_TEMP"
+            cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp_pend}")
+            cursor.execute(f"CREATE TEMPORARY TABLE {tabla_temp_pend} LIKE {tabla_pendientes}")
+            
+            if len(df_snowflake_pendientes) > 0:
+                print(f"   - Procesando {len(df_snowflake_pendientes):,} licencias pendientes...")
+
+                required_columns_pend = [
+                    'AFILIADO_RUT', 'LCC_COMCOD', 'LCC_COMCOR', 'LCC_OPERADOR', 'LCC_MEDRUT', 'LCC_EMPRUT',
+                    'LCC_IDN', 'EPISODIO_ACUM_DIAS', 'EPISODIO_FEC_INI', 'CONTINUA_CALC', 'TIPO_F_LM_COD', 'TIPO_F_LM',
+                    'FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'DIASSOLICITADO', 'CIE_F', 'CIE_F_COD',
+                    'CIE_GRUPO', 'LM_DIAGNOSTICO', 'LM_ANTECEDENTES_CLINICOS', 'COT_EDAD', 'COT_GENERO',
+                    'RENTA_ESTIMADA', 'SEMAFORO', 'PROBABILIDAD_APROBACION', 'UMBRAL_VERDE', 'UMBRAL_AMARILLO',
+                    'FECHA_PROCESAMIENTO', 'FECHA_PROCESAMIENTO_STR', 'MODELO_VERSION', 'TARGET_FT3',
+                    'TARGET_APRUEBA', 'GLOSA_GENERADA', 'CAUSAL_GENERADA', 'LEAK_FT', 'LEAK_CAUSALES',
+                    'LEAK_DIASAUTORIZADOS', 'LEAK_GLOSAS', 'LEAK_ESTADOLM', 'LEAK_FALLO_PE'
+                ]
+                for col in required_columns_pend:
+                    if col not in df_snowflake_pendientes.columns:
+                        df_snowflake_pendientes[col] = pd.Series([None] * len(df_snowflake_pendientes), index=df_snowflake_pendientes.index)
+
+                df_snowflake_pendientes['GLOSA_GENERADA'] = df_snowflake_pendientes['GLOSA_GENERADA'].astype(str).str[:500]
+                df_snowflake_pendientes['CAUSAL_GENERADA'] = df_snowflake_pendientes['CAUSAL_GENERADA'].astype(str).str[:100]
+                df_snowflake_pendientes['CIE_F'] = df_snowflake_pendientes['CIE_F'].astype(str).str[:120]
+                df_snowflake_pendientes['CIE_GRUPO'] = df_snowflake_pendientes['CIE_GRUPO'].astype(str).str[:30]
+
+                df_to_save_pend = df_snowflake_pendientes[required_columns_pend].copy()
+
+                # Crear tabla temporal (se creará con write_pandas)
+                success, nchunks, nrows, _ = write_pandas(
+                    conn=loader.conn,
+                    df=df_to_save_pend,
+                    table_name=tabla_temp_pend,
+                    database=loader.connection_params['database'],
+                    schema=loader.connection_params['schema'],
+                    quote_identifiers=False,
+                    auto_create_table=False,
+                    overwrite=False
+                )
+                
+                if success:
+                    print(f"   ✓ {nrows:,} registros cargados en tabla temporal")
+                    
+                    merge_pend_query = f"""
+                    MERGE INTO {tabla_pendientes} AS target
+                    USING {tabla_temp_pend} AS source
+                    ON target.AFILIADO_RUT = source.AFILIADO_RUT 
+                       AND target.LCC_COMCOR = source.LCC_COMCOR
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            LCC_COMCOD = source.LCC_COMCOD,
+                            LCC_OPERADOR = source.LCC_OPERADOR,
+                            LCC_MEDRUT = source.LCC_MEDRUT,
+                            LCC_EMPRUT = source.LCC_EMPRUT,
+                            LCC_IDN = source.LCC_IDN,
+                            EPISODIO_ACUM_DIAS = source.EPISODIO_ACUM_DIAS,
+                            EPISODIO_FEC_INI = source.EPISODIO_FEC_INI,
+                            CONTINUA_CALC = source.CONTINUA_CALC,
+                            TIPO_F_LM_COD = source.TIPO_F_LM_COD,
+                            TIPO_F_LM = source.TIPO_F_LM,
+                            FECHA_RECEPCION = source.FECHA_RECEPCION,
+                            FECHA_INICIO = source.FECHA_INICIO,
+                            FECHA_TERMINO = source.FECHA_TERMINO,
+                            DIASSOLICITADO = source.DIASSOLICITADO,
+                            CIE_F = source.CIE_F,
+                            CIE_F_COD = source.CIE_F_COD,
+                            CIE_GRUPO = source.CIE_GRUPO,
+                            LM_DIAGNOSTICO = source.LM_DIAGNOSTICO,
+                            LM_ANTECEDENTES_CLINICOS = source.LM_ANTECEDENTES_CLINICOS,
+                            COT_EDAD = source.COT_EDAD,
+                            COT_GENERO = source.COT_GENERO,
+                            RENTA_ESTIMADA = source.RENTA_ESTIMADA,
+                            SEMAFORO = COALESCE(target.SEMAFORO, source.SEMAFORO),
+                            PROBABILIDAD_APROBACION = COALESCE(target.PROBABILIDAD_APROBACION, source.PROBABILIDAD_APROBACION),
+                            UMBRAL_VERDE = COALESCE(target.UMBRAL_VERDE, source.UMBRAL_VERDE),
+                            UMBRAL_AMARILLO = COALESCE(target.UMBRAL_AMARILLO, source.UMBRAL_AMARILLO),
+                            FECHA_PROCESAMIENTO = COALESCE(target.FECHA_PROCESAMIENTO, source.FECHA_PROCESAMIENTO),
+                            FECHA_PROCESAMIENTO_STR = COALESCE(target.FECHA_PROCESAMIENTO_STR, source.FECHA_PROCESAMIENTO_STR),
+                            MODELO_VERSION = COALESCE(target.MODELO_VERSION, source.MODELO_VERSION),
+                            TARGET_FT3 = source.TARGET_FT3,
+                            TARGET_APRUEBA = source.TARGET_APRUEBA,
+                            GLOSA_GENERADA = COALESCE(target.GLOSA_GENERADA, source.GLOSA_GENERADA),
+                            CAUSAL_GENERADA = COALESCE(target.CAUSAL_GENERADA, source.CAUSAL_GENERADA),
+                            LEAK_FT = source.LEAK_FT,
+                            LEAK_CAUSALES = source.LEAK_CAUSALES,
+                            LEAK_DIASAUTORIZADOS = source.LEAK_DIASAUTORIZADOS,
+                            LEAK_GLOSAS = source.LEAK_GLOSAS,
+                            LEAK_ESTADOLM = source.LEAK_ESTADOLM,
+                            LEAK_FALLO_PE = source.LEAK_FALLO_PE
+                    WHEN NOT MATCHED THEN
+                        INSERT (AFILIADO_RUT, LCC_COMCOD, LCC_COMCOR, LCC_OPERADOR,
+                               LCC_MEDRUT, LCC_EMPRUT, LCC_IDN,
+                               EPISODIO_ACUM_DIAS, EPISODIO_FEC_INI, CONTINUA_CALC,
+                               TIPO_F_LM_COD, TIPO_F_LM,
+                               FECHA_RECEPCION, FECHA_INICIO, FECHA_TERMINO, DIASSOLICITADO,
+                               CIE_F, CIE_F_COD, CIE_GRUPO, LM_DIAGNOSTICO, LM_ANTECEDENTES_CLINICOS,
+                               COT_EDAD, COT_GENERO, RENTA_ESTIMADA,
+                               SEMAFORO, PROBABILIDAD_APROBACION, UMBRAL_VERDE, UMBRAL_AMARILLO,
+                               FECHA_PROCESAMIENTO, FECHA_PROCESAMIENTO_STR, MODELO_VERSION,
+                               TARGET_FT3, TARGET_APRUEBA,
+                               GLOSA_GENERADA, CAUSAL_GENERADA,
+                               LEAK_FT, LEAK_CAUSALES, LEAK_DIASAUTORIZADOS,
+                               LEAK_GLOSAS, LEAK_ESTADOLM, LEAK_FALLO_PE)
+                        VALUES (source.AFILIADO_RUT, source.LCC_COMCOD, source.LCC_COMCOR, source.LCC_OPERADOR,
+                               source.LCC_MEDRUT, source.LCC_EMPRUT, source.LCC_IDN,
+                               source.EPISODIO_ACUM_DIAS, source.EPISODIO_FEC_INI, source.CONTINUA_CALC,
+                               source.TIPO_F_LM_COD, source.TIPO_F_LM,
+                               source.FECHA_RECEPCION, source.FECHA_INICIO, source.FECHA_TERMINO, source.DIASSOLICITADO,
+                               source.CIE_F, source.CIE_F_COD, source.CIE_GRUPO, source.LM_DIAGNOSTICO, source.LM_ANTECEDENTES_CLINICOS,
+                               source.COT_EDAD, source.COT_GENERO, source.RENTA_ESTIMADA,
+                               source.SEMAFORO, source.PROBABILIDAD_APROBACION, source.UMBRAL_VERDE, source.UMBRAL_AMARILLO,
+                               source.FECHA_PROCESAMIENTO, source.FECHA_PROCESAMIENTO_STR, source.MODELO_VERSION,
+                               source.TARGET_FT3, source.TARGET_APRUEBA,
+                               source.GLOSA_GENERADA, source.CAUSAL_GENERADA,
+                               source.LEAK_FT, source.LEAK_CAUSALES, source.LEAK_DIASAUTORIZADOS,
+                               source.LEAK_GLOSAS, source.LEAK_ESTADOLM, source.LEAK_FALLO_PE)
+                    """
+                    
+                    cursor.execute(merge_pend_query)
+                    merge_pend_count = cursor.rowcount
+                    print(f"   ✓ MERGE completado: {merge_pend_count} registros afectados")
+                    
+                    # Limpiar tabla temporal
+                    cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp_pend}")
+                    
+                    # Obtener total de registros en la tabla
+                    cursor.execute(f"SELECT COUNT(*) FROM {tabla_pendientes}")
+                    total_registros = cursor.fetchone()[0]
+                    print(f"   ✓ Total registros en tabla: {total_registros:,}")
+                else:
+                    print(f"   ⚠ Error al cargar datos en tabla temporal")
+            else:
+                print(f"   - No hay licencias pendientes para procesar")
+            
+            cursor.close()
+            
+        except Exception as e:
+            print(f"   ⚠ Advertencia al guardar en Snowflake: {e}")
+            print("   Continuando con generación de Excel...")
+        
+        # 8. GENERAR REPORTE EXCEL
+        print("\n8. Generando reporte Excel...")
+        filename = f'results/reporte_completo_{timestamp}.xlsx'
+        
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Resumen ejecutivo
+            resumen = {
+                'Métrica': [
+                    'INFORMACIÓN GENERAL',
+                    'Período analizado',
+                    'Total licencias procesadas',
+                    '  - Con dictamen',
+                    '  - Pendientes',
+                    '',
+                    'LICENCIAS PENDIENTES - PREDICCIONES',
+                    '  - FT1 (ya aprobados)',
+                    '  - VERDE (recomendar aprobación)',
+                    '  - AMARILLO (revisar)',
+                    '  - ROJO (recomendar rechazo)',
+                    '',
+                    'LICENCIAS PENDIENTES EN VERDE',
+                    '  - Total casos',
+                    '  - Días solicitados',
+                    '',
+                    'VALIDACIÓN CON HISTÓRICO',
+                    '  - Precisión zona VERDE',
+                    '  - Falsos positivos',
+                    '',
+                    'UMBRALES UTILIZADOS',
+                    '  - Verde (aprobación)',
+                    '  - Amarillo (revisión)',
+                    '  - Rojo (rechazo)'
+                ],
+                'Valor': [
+                    '',
+                    f"{date_from} al {date_to}",
+                    f"{total_licencias:,}",
+                    f"{len(info_con_dictamen):,}",
+                    f"{len(info_pendientes):,}",
+                    '',
+                    '',
+                    f"{(info_pendientes['SEMAFORO'] == 'FT1_APROBADO').sum():,}",
+                    f"{(info_pendientes['SEMAFORO'] == 'VERDE').sum():,}",
+                    f"{(info_pendientes['SEMAFORO'] == 'AMARILLO').sum():,}",
+                    f"{(info_pendientes['SEMAFORO'] == 'ROJO').sum():,}",
+                    '',
+                    '',
+                    f"{len(verde_pendientes):,}" if len(verde_pendientes) > 0 else "0",
+                    f"{verde_pendientes['DIASSOLICITADO'].sum():,}" if len(verde_pendientes) > 0 else "0",
+                    '',
+                    '',
+                    f"{precision:.1%}" if len(verde_con_dictamen) > 0 else "N/A",
+                    f"{fp:,}" if len(verde_con_dictamen) > 0 else "N/A",
+                    '',
+                    '',
+                    f">= {optimal_verde:.2f}",
+                    f"{optimal_amarillo:.2f} - {optimal_verde:.2f}",
+                    f"< {optimal_amarillo:.2f}"
+                ]
+            }
+            
+            pd.DataFrame(resumen).to_excel(writer, sheet_name='Resumen', index=False)
+            
+            # Todas las pendientes ya ordenadas anteriormente
+            info_pendientes_sorted.to_excel(writer, sheet_name='Licencias_Pendientes', index=False)
+            
+            # Solo pendientes en verde
+            if len(verde_pendientes) > 0:
+                verde_pendientes_sorted = verde_pendientes.sort_values(
+                    'PROBABILIDAD_APROBACION', ascending=False
+                )
+                verde_pendientes_sorted.to_excel(writer, sheet_name='Pendientes_Verde', index=False)
+            
+            # Licencias con dictamen (para validación)
+            if len(info_con_dictamen) > 0:
+                info_con_dictamen_sorted = info_con_dictamen.sort_values(
+                    ['SEMAFORO', 'PROBABILIDAD_APROBACION'], 
+                    ascending=[True, False]
+                )
+                info_con_dictamen_sorted.to_excel(writer, sheet_name='Con_Dictamen', index=False)
+            
+            # Errores del modelo (FP en verde)
+            if len(verde_con_dictamen) > 0:
+                errores = verde_con_dictamen[verde_con_dictamen['TARGET_FT3'] == 0]
+                if len(errores) > 0:
+                    errores_sorted = errores.sort_values('PROBABILIDAD_APROBACION', ascending=False)
+                    errores_sorted.to_excel(writer, sheet_name='Falsos_Positivos', index=False)
+        
+        print(f"\n✓ Reporte guardado exitosamente en: {filename}")
+        print(f"\n✓ CONFIRMACIÓN: Se procesaron {total_licencias:,} licencias totales")
+        print(f"  - Con dictamen: {len(info_con_dictamen):,}")
+        print(f"  - Pendientes: {len(info_pendientes):,}")
+        print(f"✓ Todas tienen probabilidad y clasificación asignada")
+        print(f"\n✓ SNOWFLAKE: Tablas actualizadas:")
+        print(f"  - FT30_PREDICCIONES_DIARIAS: Todas las predicciones del día")
+        print(f"  - FT30_LICENCIAS_PENDIENTES: Solo licencias pendientes")
+        
+        loader.disconnect()
+        return filename
+        
+    except Exception as e:
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()
+        if loader.conn:
+            loader.disconnect()
+        raise
+
+if __name__ == "__main__":
+    import argparse
+    from datetime import datetime, timedelta
+    
+    # Parser para argumentos de línea de comandos
+    parser = argparse.ArgumentParser(
+        description='Aplicar modelo FastTrack 2.0 a licencias médicas',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos de uso:
+  # Usar fecha por defecto (día anterior)
+  python apply_model_to_all_licenses.py
+  
+  # Últimos 7 días
+  python apply_model_to_all_licenses.py --ultimos-dias 7
+  
+  # Últimos 90 días
+  python apply_model_to_all_licenses.py --ultimos-dias 90
+  
+  # Especificar rango de fechas
+  python apply_model_to_all_licenses.py --desde 2025-06-01 --hasta 2025-08-31
+  
+  # Solo un día específico
+  python apply_model_to_all_licenses.py --desde 2025-08-05 --hasta 2025-08-05
+  
+  # Desactivar optimización de umbrales
+  python apply_model_to_all_licenses.py --no-optimizar
+  
+  # Cambiar tasa de reversión COMPIN
+  python apply_model_to_all_licenses.py --compin 0.79
+        """
+    )
+    
+    # Argumentos de fecha
+    parser.add_argument('--desde', '--from', 
+                       type=str,
+                       help='Fecha inicial (YYYY-MM-DD). Por defecto: día anterior')
+    parser.add_argument('--hasta', '--to', 
+                       type=str,
+                       help='Fecha final (YYYY-MM-DD). Por defecto: día anterior')
+    parser.add_argument('--ultimos-dias', 
+                       type=int,
+                       help='Procesar los últimos N días (sobrescribe --desde)')
+    
+    # Otros parámetros
+    parser.add_argument('--no-optimizar', 
+                       action='store_true',
+                       help='Desactivar optimización de umbrales')
+    parser.add_argument('--compin', 
+                       type=float, 
+                       default=0.5,
+                       help='Tasa de reversión COMPIN (0.0-1.0). Por defecto: 0.5')
+    parser.add_argument('--costo-manual', 
+                       type=int, 
+                       default=5000,
+                       help='Costo de revisión manual. Por defecto: 5000')
+    
+    args = parser.parse_args()
+    
+    # Determinar fechas
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    # Si se especifica --ultimos-dias, tiene prioridad
+    if args.ultimos_dias:
+        date_to = yesterday
+        date_from = (datetime.now() - timedelta(days=args.ultimos_dias)).strftime('%Y-%m-%d')
+    else:
+        # Fecha final
+        if args.hasta:
+            date_to = args.hasta
+        else:
+            date_to = yesterday  # Por defecto: día anterior
+        
+        # Fecha inicial
+        if args.desde:
+            date_from = args.desde
+        else:
+            date_from = yesterday  # Por defecto: día anterior (solo un día)
+    
+    # Validar fechas
+    try:
+        datetime.strptime(date_from, '%Y-%m-%d')
+        datetime.strptime(date_to, '%Y-%m-%d')
+    except ValueError:
+        print("ERROR: Las fechas deben estar en formato YYYY-MM-DD")
+        exit(1)
+    
+    # Mostrar configuración
+    print(f"\nCONFIGURACIÓN:")
+    print(f"- Período: {date_from} al {date_to}")
+    print(f"- Optimización de umbrales: {'Sí' if not args.no_optimizar else 'No'}")
+    print(f"- Tasa reversión COMPIN: {args.compin*100:.0f}%")
+    print(f"- Costo revisión manual: ${args.costo_manual:,}")
+    
+    # Ejecutar con parámetros
+    report_file = apply_model_to_all_licenses(
+        date_from=date_from,
+        date_to=date_to,
+        optimize_thresholds=not args.no_optimizar,
+        cost_manual_review=args.costo_manual,
+        compin_reversion_rate=args.compin
+    )
+    
+    print(f"\n{'='*80}")
+    print(f"PROCESO COMPLETADO")
+    print(f"Archivo generado: {report_file}")
+    print(f"{'='*80}")

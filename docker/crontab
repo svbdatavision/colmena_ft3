@@ -1,0 +1,19 @@
+# Crontab para FastTrack 3.0
+# Formato: minuto hora dia mes dia_semana comando
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# TODOS LOS DÍAS - Pipeline diario a las 07:50 AM (hora Chile)
+# Ejecuta: 1) query_diaria.sql 2) query_2.sql 3) FT3_dia.py
+50 7 * * * /bin/bash /app/run_daily_pipeline.sh >> /app/logs/pipeline_$(date +\%Y\%m\%d).log 2>&1
+
+# LUNES - Pipeline semanal a las 07:50 AM (procesa fin de semana)
+# Ejecuta: 1) query_lunes.sql 2) query_2.sql 3) FT30.py --ultimos-dias 7
+50 7 * * 1 /bin/bash /app/run_weekly_pipeline.sh >> /app/logs/weekly_$(date +\%Y\%m\%d).log 2>&1
+
+# DÍA 1 DE CADA MES - Pipeline mensual a las 3:00 AM
+# Ejecuta: 1) query_1.sql 2) query_2.sql 3) FT3_dia.py
+0 3 1 * * /bin/bash /app/run_monthly_pipeline.sh >> /app/logs/monthly_$(date +\%Y\%m\%d).log 2>&1
+
+# Heartbeat cada 3 horas para verificar que cron funciona
+0 */3 * * * echo "$(date): Cron activo" >> /app/logs/cron_heartbeat.log 2>&1

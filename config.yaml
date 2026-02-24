@@ -1,0 +1,89 @@
+# Model Configuration
+model:
+  name: "COMPIN_LightGBM_Predictor"
+  version: "1.0.0"
+  type: "classification"
+
+# Data Configuration
+data:
+  snowflake:
+    warehouse: "P_ML"
+    database: "OPX"
+    schema: "P_DDV_OPX_MDPREDICTIVO"
+    role: "EX_ML"
+
+  # Feature groups are defined in Variables_cat_train.py
+  # The data loader will automatically import and use those definitions
+  # This ensures consistency and excludes leak variables
+  features:
+    # Features are dynamically loaded from Variables_cat_train.py
+    # Categories: llaves, fechas, categoricas, numericas, binarias, texto_no_estructurado
+    # Excluded: leak variables and non-selected target variables
+    source: "Variables_cat_train.py"
+
+  # Target variable
+  target: "TARGET_FT3"
+
+  # Train/test split
+  test_size: 0.2
+  validation_size: 0.1
+  random_state: 42
+
+# Model Parameters
+model_params:
+  lightgbm:
+    objective: "binary"
+    metric: "auc"
+    scale_pos_weight: 5.0 # Penalizar más los falsos positivos
+    boosting_type: "gbdt"
+    num_leaves: 31
+    learning_rate: 0.05
+    feature_fraction: 0.9
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    verbose: -1
+    random_state: 42
+    n_estimators: 300
+
+  # Hyperparameter tuning
+  hyperparam_tuning:
+    cv_folds: 5
+    scoring: "roc_auc"
+    n_trials: 30
+    param_grid:
+      num_leaves: [20, 31, 50, 100]
+      max_depth: [5, 10, 15, -1]
+      min_child_samples: [10, 20, 30, 50]
+      subsample: [0.6, 0.7, 0.8, 0.9, 1.0]
+      colsample_bytree: [0.6, 0.7, 0.8, 0.9, 1.0]
+
+# Auditing Configuration
+auditing:
+  enabled: true
+  checks:
+    - data_quality
+    - feature_importance
+    - model_performance
+    - fairness_metrics
+    - data_drift
+
+  thresholds:
+    auc_min: 0.7
+    precision_min: 0.6
+    recall_min: 0.6
+    f1_min: 0.6
+
+  protected_attributes:
+    - COT_GENERO
+    - COT_EDAD
+
+  drift_detection:
+    method: "ks_test"
+    threshold: 0.05
+
+# Output Configuration
+output:
+  model_path: "models/"
+  results_path: "results/"
+  logs_path: "logs/"
+  reports_path: "reports/"

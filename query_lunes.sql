@@ -1,0 +1,1417 @@
+-- =====================================================
+-- SCRIPT PARA INSERTAR LICENCIAS DE LOS ÚLTIMOS 3 DÍAS EN MODELO_LM_202507_BASE
+-- =====================================================
+-- Este script procesa las licencias médicas de los últimos 3 días desde ALFIL
+-- Los campos de afiliado ahora vienen directamente de ALFIL (no de FARO/CPA)
+-- Solo busca información histórica del médico en CPA
+-- Solo inserta registros nuevos que no existan en MODELO_LM_202507_BASE
+
+-- Establecer contexto de base de datos
+USE DATABASE OPX;
+USE SCHEMA P_DDV_OPX_MDPREDICTIVO;
+
+-- Rango objetivo: últimos 3 días (viernes a domingo)
+SET start_date = DATEADD(day, -3, CURRENT_DATE());
+SET end_date = DATEADD(day, -1, CURRENT_DATE());
+
+INSERT INTO OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE (
+    AFILIADO_RUT,
+    LCC_COMCOD,
+    LCC_COMCOR,
+    LCC_OPERADOR,
+    PRESTADOR_RUT,
+    EMPLEADOR_RUT,
+    N_LICENCIA,
+    EPISODIO_ACUM_DIAS,
+    EPISODIO_FEC_INI,
+    CONTINUA_CALC,
+    TIPO_F_LM_COD,
+    TIPO_F_LM,
+    FECHA_RECEPCION,
+    FECHA_INICIO,
+    FECHA_TERMINO,
+    DIASSOLICITADO,
+    CIE_F,
+    CIE_F_COD,
+    CIE_GRUPO,
+    LM_DIAGNOSTICO,
+    LM_ANTECEDENTES_CLINICOS,
+    MED_CLASIFICACION,
+    MED_ESPECIALIDAD_LME,
+    EMPLEADOR_MULTIEMPLEADO,
+    COMUNA_REPOSO,
+    COMUNA_EMISION,
+    CALIDAD_TRABAJADOR,
+    LM_FORMATO,
+    LM_REPOSO_TIPO,
+    "lic_id_licencia",
+    "lic_rut_trabajador",
+    "lic_dv_trabajador",
+    FECHA_EMISION_DT,
+    "lic_fecha_inicio_reposo",
+    "lic_fecha_recep_isapre",
+    "lic_dias_licencia",
+    "lic_codigo_tipo_licencia",
+    FECHA_EMP_RECEPCION,
+    FECHA_EMP_ENVIO,
+    "lic_rut_profesional",
+    "lic_pro_especialidad",
+    "lic_pro_tipo",
+    "lic_pro_dir_comuna",
+    "lic_diag_principal",
+    "lic_cie10_principal",
+    "lic_antecedentes_clinicos",
+    "lic_rut_empleador",
+    "lic_codigo_calidad_trab",
+    "lic_codigo_tipo_reposo",
+    COT_GENERO,
+    COT_EDAD,
+    "lic_reposo_dir_comuna1",
+    PRESTADOR_LOCAL_RUT,
+    PRESTADOR_LOCAL_TIPO_COD,
+    PRESTADOR_LOCAL_TIPO,
+    COMPIN_CNT,
+    FECHA_INICIO_BENEFICIOS,
+    FECHA_SUSCR_CONTRATO,
+    DEUDA_SIN_I,
+    DEUDA_SIN_I_ULT12M,
+    RENTA_ESTIMADA,
+    CTD_ENVIA_PERITAJE,
+    PERITAJE_LM_PERITADA,
+    PERITAJE_FALLO_1,
+    CTD_ENVIA_INFORME_MEDICO,
+    MEDICO_COLMENA,
+    REC_LCC_VISJUS,
+    REC_GLS_CAUMOD,
+    IS_REPOSO_INJUSTIFICADO_ISAPRE_FLAG,
+    RESOLUCION_COMPIN,
+    FECHA_ENVIO_A_COMPIN,
+    FECHA_RESOLUCION_COMPIN,
+    EXISTE_RESOL_COMPIN,
+    TIEMPO_RESOLUCION_COMPIN_CURRENT,
+    PRESTADOR_ESPECIALIDAD_PSC,
+    PREST_TOP_CIE_F,
+    PREST_TOP_GRUPOCIE,
+    PRESTADOR_TIPO,
+    FECHA_INGRESO_PREST,
+    FECHA_VISACION,
+    I_DIASAUTORIZADOS,
+    FECHA_RECONSIDERACION,
+    M_DIASAUTORIZADOS,
+    F_DIASAUTORIZADOS,
+    I_RESOLUCION,
+    LCC_PAGDIA,
+    ESTADO_LM,
+    IS_SIN_SUBSIDIO_FLAG,
+    IS_RECHAZADA_ISAPRE_CURRENT_FLAG,
+    IS_MODIFICADA_REAL_ISAPRE_FLAG,
+    DIAS_REDUCIDOS_ISAPRE_CURRENT,
+    IS_MODIFICADA_ISAPRE_FLAG,
+    IS_PSIQUIATRICA_CURRENT_FLAG,
+    DIFF_DIAS_PERDIDOS_RESOL_CURRENT
+)
+
+WITH 
+-- CTE para obtener información histórica del prestador/médico
+-- Busca el historial del médico independiente del afiliado
+cpa_historico_prestador AS (
+    SELECT 
+        PRESTADOR_RUT,
+        PRESTADOR_ESPECIALIDAD_PSC,
+        PREST_TOP_CIE_F,
+        PREST_TOP_GRUPOCIE,
+        PRESTADOR_TIPO,
+        PREST_FECHA_INGRESO,
+        ROW_NUMBER() OVER (
+            PARTITION BY PRESTADOR_RUT 
+            ORDER BY TO_DATE(FECHA_RECEPCION) DESC NULLS LAST
+        ) AS rn
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.CPA_LM_BASE_AMPLIADA
+    WHERE TO_DATE(FECHA_RECEPCION) < $start_date  -- Solo registros anteriores al rango objetivo
+      AND PRESTADOR_RUT IS NOT NULL
+)
+
+SELECT
+    -- Orden exacto según MODELO_LM_202507_BASE actualizado (94 columnas)
+    ALFIL.AFILIADO_RUT,                                          -- 1. AFILIADO_RUT VARCHAR(11)
+    ALFIL.LCC_COMCOD,                                            -- 2. LCC_COMCOD NUMBER(38,0)
+    ALFIL.LCC_COMCOR,                                            -- 3. LCC_COMCOR NUMBER(38,0)
+    ALFIL.LCC_OPERADOR,                                         -- 4. LCC_OPERADOR NUMBER(38,0)
+    ALFIL.LCC_MEDRUT AS PRESTADOR_RUT,                          -- 5. PRESTADOR_RUT VARCHAR(11)
+    ALFIL.LCC_EMPRUT AS EMPLEADOR_RUT,                          -- 6. EMPLEADOR_RUT VARCHAR(11)
+    ALFIL."lcc_idn" AS N_LICENCIA,                              -- 7. N_LICENCIA VARCHAR(11)
+    ALFIL.EPISODIO_ACUM_DIAS,                                   -- 8. EPISODIO_ACUM_DIAS NUMBER(38,0)
+    ALFIL.EPISODIO_FEC_INI,                                     -- 9. EPISODIO_FEC_INI DATE
+    ALFIL.CONTINUA_CALC,                                        -- 10. CONTINUA_CALC VARCHAR(1)
+    COALESCE(NULLIF(ALFIL.TIPO_F_LM_COD, 0), ALFIL."lic_codigo_tipo_licencia", 0) AS TIPO_F_LM_COD, -- 11. TIPO_F_LM_COD NUMBER(38,0)
+    COALESCE(
+        NULLIF(ALFIL.TIPO_F_LM, ''),
+        CASE ALFIL."lic_codigo_tipo_licencia"
+            WHEN 1 THEN 'ENFERMEDAD COMUN'
+            WHEN 2 THEN 'PRORROGA MEDICINA PREVENTIVA'
+            WHEN 3 THEN 'MATERNAL'
+            WHEN 4 THEN 'ENFERM. HIJO < 1 AÑO'
+            WHEN 5 THEN 'ACCIDENTE DEL TRABAJO'
+            WHEN 6 THEN 'ENFERMEDAD PROFESIONAL'
+            WHEN 7 THEN 'PATOLOGIA DEL EMBARAZO'
+            ELSE 'OTRO'
+        END
+    ) AS TIPO_F_LM,                                            -- 12. TIPO_F_LM VARCHAR(35)
+    TO_DATE(ALFIL.FECHA_RECEPCION) AS FECHA_RECEPCION,          -- 13. FECHA_RECEPCION DATE
+    ALFIL.FECHA_INICIO,                                         -- 14. FECHA_INICIO TIMESTAMP_NTZ(3)
+    ALFIL.FECHA_TERMINO,                                        -- 15. FECHA_TERMINO TIMESTAMP_NTZ(3)
+    ALFIL.DIASSOLICITADO,                                       -- 16. DIASSOLICITADO NUMBER(38,0)
+    ALFIL.CIE_F,                                                -- 17. CIE_F VARCHAR(120)
+    ALFIL.CIE_F_COD,                                            -- 18. CIE_F_COD VARCHAR(10)
+    ALFIL.CIE_GRUPO,                                            -- 19. CIE_GRUPO VARCHAR(120)
+    ALFIL.LM_DIAGNOSTICO,                                       -- 20. LM_DIAGNOSTICO VARCHAR(100)
+    ALFIL.LM_ANTECEDENTES_CLINICOS,                            -- 21. LM_ANTECEDENTES_CLINICOS VARCHAR(100)
+    ALFIL.MED_CLASIFICACION,                                    -- 22. MED_CLASIFICACION VARCHAR(50)
+    ALFIL.MED_ESPECIALIDAD_LME,                                 -- 23. MED_ESPECIALIDAD_LME VARCHAR(80)
+    ALFIL.EMPLEADOR_MULTIEMPLEADO,                              -- 24. EMPLEADOR_MULTIEMPLEADO VARCHAR(2)
+    ALFIL.AFI_DIR_REPOSO1_COMUNA_COD AS COMUNA_REPOSO,         -- 25. COMUNA_REPOSO NUMBER(38,0)
+    ALFIL.PREST_COMUNA_COD_EMISION AS COMUNA_EMISION,          -- 26. COMUNA_EMISION NUMBER(38,0)
+    CAST(ALFIL.CALIDAD_TRABAJADOR AS VARCHAR(35)) AS CALIDAD_TRABAJADOR, -- 27. CALIDAD_TRABAJADOR VARCHAR(35)
+    ALFIL.LM_FORMATO,                                           -- 28. LM_FORMATO VARCHAR(20)
+    ALFIL.LM_REPOSO_TIPO,                                       -- 29. LM_REPOSO_TIPO VARCHAR(22)
+    ALFIL."lic_id_licencia",                                    -- 30. "lic_id_licencia" NUMBER(38,0)
+    ALFIL."lic_rut_trabajador",                                 -- 31. "lic_rut_trabajador" NUMBER(38,0)
+    ALFIL."lic_dv_trabajador",                                  -- 32. "lic_dv_trabajador" VARCHAR(1)
+    TO_DATE(ALFIL."lic_fecha_emision") AS FECHA_EMISION_DT,     -- 33. FECHA_EMISION_DT DATE
+    ALFIL."lic_fecha_inicio_reposo",                            -- 34. "lic_fecha_inicio_reposo" TIMESTAMP_NTZ(3)
+    ALFIL."lic_fecha_recep_isapre",                             -- 35. "lic_fecha_recep_isapre" TIMESTAMP_NTZ(3)
+    ALFIL."lic_dias_licencia",                                  -- 36. "lic_dias_licencia" NUMBER(38,0)
+    ALFIL."lic_codigo_tipo_licencia",                           -- 37. "lic_codigo_tipo_licencia" NUMBER(38,0)
+    TO_DATE(ALFIL."lic_emp_fecha_recepcion") AS FECHA_EMP_RECEPCION, -- 38. FECHA_EMP_RECEPCION DATE
+    TO_DATE(ALFIL."lic_emp_fecha_envio") AS FECHA_EMP_ENVIO,   -- 39. FECHA_EMP_ENVIO DATE
+    ALFIL."lic_rut_profesional",                                -- 40. "lic_rut_profesional" NUMBER(38,0)
+    ALFIL."lic_pro_especialidad",                               -- 41. "lic_pro_especialidad" VARCHAR(80)
+    ALFIL."lic_pro_tipo",                                       -- 42. "lic_pro_tipo" NUMBER(38,0)
+    ALFIL."lic_pro_dir_comuna",                                 -- 43. "lic_pro_dir_comuna" NUMBER(38,0)
+    ALFIL."lic_diag_principal",                                 -- 44. "lic_diag_principal" VARCHAR(255)
+    ALFIL."lic_cie10_principal",                                -- 45. "lic_cie10_principal" VARCHAR(12)
+    ALFIL."lic_antecedentes_clinicos",                          -- 46. "lic_antecedentes_clinicos" VARCHAR(255)
+    ALFIL."lic_rut_empleador",                                  -- 47. "lic_rut_empleador" NUMBER(38,0)
+    ALFIL."lic_codigo_calidad_trab",                            -- 48. "lic_codigo_calidad_trab" NUMBER(38,0)
+    ALFIL."lic_codigo_tipo_reposo",                             -- 49. "lic_codigo_tipo_reposo" NUMBER(38,0)
+    CASE 
+        WHEN UPPER(TRIM(ALFIL."lic_sexo_trabajador")) = 'M' THEN 'Masc'
+        WHEN UPPER(TRIM(ALFIL."lic_sexo_trabajador")) = 'F' THEN 'Fem'
+        ELSE ALFIL."lic_sexo_trabajador"
+    END AS COT_GENERO,                                          -- 50. COT_GENERO VARCHAR(4) 
+    ALFIL."lic_edad_trabajador" AS COT_EDAD,                    -- 51. COT_EDAD NUMBER(38,0)
+    ALFIL."lic_reposo_dir_comuna1",                             -- 52. "lic_reposo_dir_comuna1" NUMBER(38,0)
+    ALFIL.PRESTADOR_LOCAL_RUT,                                  -- 53. PRESTADOR_LOCAL_RUT VARCHAR(11)
+    ALFIL.PRESTADOR_LOCAL_TIPO_COD,                             -- 54. PRESTADOR_LOCAL_TIPO_COD NUMBER(38,0)
+    ALFIL.PRESTADOR_LOCAL_TIPO,                                 -- 55. PRESTADOR_LOCAL_TIPO VARCHAR(19)
+    ALFIL.COMPIN_CNT,                                           -- 56. COMPIN_CNT VARCHAR(35)
+    -- Ahora estos campos vienen directamente de ALFIL, no de FARO
+    ALFIL.FECHA_INICIO_BENEFICIOS,                              -- 57. FECHA_INICIO_BENEFICIOS TIMESTAMP_NTZ(3)
+    ALFIL.FECHA_SUSCR_CONTRATO,                                 -- 58. FECHA_SUSCR_CONTRATO TIMESTAMP_NTZ(3)
+    COALESCE(ALFIL.DEUDA_SIN_I, 0) AS DEUDA_SIN_I,            -- 59. DEUDA_SIN_I NUMBER(31,4)
+    COALESCE(ALFIL.DEUDA_SIN_I_ULT12M, 0) AS DEUDA_SIN_I_ULT12M, -- 60. DEUDA_SIN_I_ULT12M NUMBER(31,4)
+    COALESCE(ALFIL.RENTA_ESTIMADA, 0) AS RENTA_ESTIMADA,       -- 61. RENTA_ESTIMADA FLOAT
+    COALESCE(ALFIL.CTD_ENVIA_PERITAJE, 0) AS CTD_ENVIA_PERITAJE,  -- 62. CTD_ENVIA_PERITAJE NUMBER(13,0)
+    COALESCE(ALFIL.PERITAJE_LM_PERITADA, '0') AS PERITAJE_LM_PERITADA, -- 63. PERITAJE_LM_PERITADA VARCHAR(11)
+    ALFIL.PERITAJE_FALLO_1,                                     -- 64. PERITAJE_FALLO_1 VARCHAR(255)
+    COALESCE(ALFIL.CTD_ENVIA_INFORME_MEDICO, 0) AS CTD_ENVIA_INFORME_MEDICO, -- 65. CTD_ENVIA_INFORME_MEDICO NUMBER(13,0)
+    NULL AS MEDICO_COLMENA,                                     -- 66. MEDICO_COLMENA VARCHAR(8) - No visada aún
+    NULL AS REC_LCC_VISJUS,                                     -- 67. REC_LCC_VISJUS VARCHAR(500) - No visada aún
+    NULL AS REC_GLS_CAUMOD,                                     -- 68. REC_GLS_CAUMOD VARCHAR(50) - No visada aún
+    0 AS IS_REPOSO_INJUSTIFICADO_ISAPRE_FLAG,                   -- 69. IS_REPOSO_INJUSTIFICADO_ISAPRE_FLAG NUMBER(1,0) - No evaluado aún
+    NULL AS RESOLUCION_COMPIN,                                  -- 70. RESOLUCION_COMPIN VARCHAR(31) - No hay COMPIN aún
+    NULL AS FECHA_ENVIO_A_COMPIN,                               -- 71. FECHA_ENVIO_A_COMPIN DATE - No enviada a COMPIN
+    NULL AS FECHA_RESOLUCION_COMPIN,                            -- 72. FECHA_RESOLUCION_COMPIN DATE - No hay resolución
+    'NO' AS EXISTE_RESOL_COMPIN,                                -- 73. EXISTE_RESOL_COMPIN VARCHAR(22) - No existe resolución
+    NULL AS TIEMPO_RESOLUCION_COMPIN_CURRENT,                   -- 74. TIEMPO_RESOLUCION_COMPIN_CURRENT NUMBER(9,0) - No aplica
+    CPA_PREST.PRESTADOR_ESPECIALIDAD_PSC,                       -- 75. PRESTADOR_ESPECIALIDAD_PSC VARCHAR(35)
+    CPA_PREST.PREST_TOP_CIE_F,                                  -- 76. PREST_TOP_CIE_F VARCHAR(120)
+    CPA_PREST.PREST_TOP_GRUPOCIE,                               -- 77. PREST_TOP_GRUPOCIE VARCHAR(120)
+    CPA_PREST.PRESTADOR_TIPO,                                   -- 78. PRESTADOR_TIPO VARCHAR(35)
+    TO_DATE(CPA_PREST.PREST_FECHA_INGRESO) AS FECHA_INGRESO_PREST, -- 79. FECHA_INGRESO_PREST DATE
+    NULL AS FECHA_VISACION,                                     -- 80. FECHA_VISACION TIMESTAMP_NTZ(3) - No visada aún
+    NULL AS I_DIASAUTORIZADOS,                                  -- 81. I_DIASAUTORIZADOS NUMBER(38,0) - Sin dictamen aún
+    NULL AS FECHA_RECONSIDERACION,                              -- 82. FECHA_RECONSIDERACION TIMESTAMP_NTZ(3) - No aplica
+    NULL AS M_DIASAUTORIZADOS,                                  -- 83. M_DIASAUTORIZADOS NUMBER(38,0) - Sin dictamen aún
+    NULL AS F_DIASAUTORIZADOS,                                  -- 84. F_DIASAUTORIZADOS NUMBER(38,0) - Sin dictamen aún
+    NULL AS I_RESOLUCION,                                       -- 85. I_RESOLUCION NUMBER(38,0) - No hay resolución aún
+    0 AS LCC_PAGDIA,                                           -- 86. LCC_PAGDIA NUMBER(38,0) - No hay pago aún
+    'EN VISACION' AS ESTADO_LM,                                 -- 87. ESTADO_LM VARCHAR(35) - Estado sin dictamen
+    NULL AS IS_SIN_SUBSIDIO_FLAG,                                 -- 88. IS_SIN_SUBSIDIO_FLAG NUMBER(1,0) - No determinado aún
+    NULL AS IS_RECHAZADA_ISAPRE_CURRENT_FLAG,                     -- 89. IS_RECHAZADA_ISAPRE_CURRENT_FLAG NUMBER(1,0) - No rechazada aún
+    NULL AS IS_MODIFICADA_REAL_ISAPRE_FLAG,                       -- 90. IS_MODIFICADA_REAL_ISAPRE_FLAG NUMBER(1,0) - No modificada aún
+    NULL AS DIAS_REDUCIDOS_ISAPRE_CURRENT,                        -- 91. DIAS_REDUCIDOS_ISAPRE_CURRENT NUMBER(38,0) - No reducidos aún
+    NULL AS IS_MODIFICADA_ISAPRE_FLAG,                            -- 92. IS_MODIFICADA_ISAPRE_FLAG NUMBER(1,0) - No modificada aún
+    IFF(UPPER(ALFIL.CIE_GRUPO) = 'PSIQUIATRICAS', 1, 0) AS IS_PSIQUIATRICA_CURRENT_FLAG, -- 93. IS_PSIQUIATRICA_CURRENT_FLAG NUMBER(1,0) - Sí aplica
+    NULL AS DIFF_DIAS_PERDIDOS_RESOL_CURRENT                      -- 94. DIFF_DIAS_PERDIDOS_RESOL_CURRENT NUMBER(38,0) - No hay resolución aún
+
+FROM OPX.P_DDV_OPX_MDPREDICTIVO.SBN_LM_INPUT_DIARIO_ALFIL AS ALFIL
+
+-- JOIN con histórico del prestador en CPA (información del médico)
+LEFT JOIN cpa_historico_prestador AS CPA_PREST
+    ON ALFIL.LCC_MEDRUT = CPA_PREST.PRESTADOR_RUT
+    AND CPA_PREST.rn = 1  -- Solo el registro más reciente del prestador
+
+-- Filtro para evitar duplicados: solo insertar licencias que no existan
+WHERE NOT EXISTS (
+    SELECT 1 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE AS existing
+    WHERE existing.AFILIADO_RUT = ALFIL.AFILIADO_RUT
+      AND existing.LCC_COMCOR = ALFIL.LCC_COMCOR
+)
+-- Filtrar licencias del rango objetivo (últimos 3 días según ALFIL)
+AND TO_DATE(ALFIL.FECHA_RECEPCION) BETWEEN $start_date AND $end_date;
+
+-- =====================================================
+-- ACTUALIZACIÓN DIARIA DE TABLAS DE MÉTRICAS - VERSIÓN COMPLETA
+-- =====================================================
+-- Este script actualiza las tablas de métricas agregadas después de insertar
+-- nuevas licencias diarias en MODELO_LM_202507_BASE
+-- 
+-- IMPORTANTE: 
+-- 1. Procesa licencias insertadas en el rango objetivo (últimos 3 días)
+-- 2. Las métricas se calculan para el PERIODO ANTERIOR (mes pasado)
+-- 3. Solo se insertan para entidades que NO tienen métricas en ese periodo
+-- 4. Incluye métricas de HV2 y PERITAJES (exactamente como query_1.sql)
+-- =====================================================
+
+-- Definir variables de sesión
+SET periodo_anterior = TO_CHAR(DATEADD(MONTH, -1, DATE_TRUNC('MONTH', CURRENT_DATE())), 'MMYYYY');
+SET fecha_mes_anterior = DATEADD(MONTH, -1, DATE_TRUNC('MONTH', CURRENT_DATE()));
+SET fecha_mes_actual = DATE_TRUNC('MONTH', CURRENT_DATE());
+
+-- ========================================================================================
+-- TABLA 5: AFILIADO_METRICAS_15DIAS
+-- Esta tabla SÍ se recalcula para las licencias del rango objetivo
+-- ========================================================================================
+MERGE INTO OPX.P_DDV_OPX_MDPREDICTIVO.AFILIADO_METRICAS_15DIAS AS target
+USING (
+    WITH licencias_rango AS (
+        -- Licencias insertadas en el rango objetivo
+        SELECT DISTINCT AFILIADO_RUT, LCC_COMCOR, LCC_COMCOD, FECHA_RECEPCION, FECHA_EMISION_DT
+        FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE
+        WHERE DATE_TRUNC('DAY', FECHA_RECEPCION) BETWEEN $start_date AND $end_date
+    ),
+    metricas_licencias AS (
+        SELECT 
+            base.AFILIADO_RUT,
+            base.LCC_COMCOR,
+            base.LCC_COMCOD,
+            
+            -- Cantidad de licencias en últimos 15 días
+            COUNT(DISTINCT hist.LCC_COMCOR) AS CANT_LIC_U15D,
+            
+            -- Licencias con resolución COMPIN
+            COUNT(DISTINCT CASE 
+                WHEN hist.FECHA_RESOLUCION_COMPIN IS NOT NULL 
+                THEN hist.LCC_COMCOR 
+            END) AS CANT_LIC_CON_RESOLUCION_U15D,
+            
+            -- Licencias ratificadas
+            COUNT(DISTINCT CASE 
+                WHEN UPPER(hist.RESOLUCION_COMPIN) = 'RATIFICA' 
+                THEN hist.LCC_COMCOR 
+            END) AS COMPIN_RATIFICA_U15D,
+            
+            -- Licencias denegadas
+            COUNT(DISTINCT CASE 
+                WHEN UPPER(hist.RESOLUCION_COMPIN) = 'DENIEGA' 
+                THEN hist.LCC_COMCOR 
+            END) AS COMPIN_DENIEGA_U15D,
+            
+            -- Promedio días autorizados
+            AVG(CASE 
+                WHEN hist.F_DIASAUTORIZADOS > 0 
+                THEN hist.F_DIASAUTORIZADOS 
+            END) AS F_DIAS_PROMEDIO_U15D,
+            
+            -- Total días solicitados
+            SUM(hist.DIASSOLICITADO) AS TOTAL_DIAS_SOLICITADOS_U15D,
+            
+            -- Máximo días solicitados
+            MAX(hist.DIASSOLICITADO) AS MAX_DIAS_SOLICITADOS_U15D,
+            
+            -- Flag múltiples licencias
+            CASE 
+                WHEN COUNT(DISTINCT hist.LCC_COMCOR) > 1 
+                THEN 1 ELSE 0 
+            END AS FLAG_MULTIPLES_LIC_U15D,
+            
+            -- Ratio aprobación
+            CASE 
+                WHEN COUNT(DISTINCT CASE WHEN hist.RESOLUCION_COMPIN IS NOT NULL THEN hist.LCC_COMCOR END) > 0
+                THEN COUNT(DISTINCT CASE WHEN UPPER(hist.RESOLUCION_COMPIN) = 'RATIFICA' THEN hist.LCC_COMCOR END) * 1.0 /
+                     COUNT(DISTINCT CASE WHEN hist.RESOLUCION_COMPIN IS NOT NULL THEN hist.LCC_COMCOR END)
+                ELSE NULL
+            END AS RATIO_APROBACION_U15D
+            
+        FROM licencias_rango base
+        LEFT JOIN OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE hist
+            ON base.AFILIADO_RUT = hist.AFILIADO_RUT
+            AND hist.FECHA_RECEPCION >= DATEADD(DAY, -15, base.FECHA_RECEPCION)
+            AND hist.FECHA_RECEPCION < base.FECHA_RECEPCION
+        GROUP BY base.AFILIADO_RUT, base.LCC_COMCOR, base.LCC_COMCOD
+    ),
+    metricas_hv AS (
+        SELECT 
+            base.AFILIADO_RUT,
+            base.LCC_COMCOR,
+            base.LCC_COMCOD,
+            
+            -- Cantidad de prestaciones
+            COUNT(DISTINCT hv.FOLIO) AS HV_N_PRESTACIONES_U15D,
+            
+            -- Cantidad total de prestaciones
+            SUM(hv.PRESTACION_CANTIDAD) AS HV_SUM_CANTIDAD_PREST_U15D,
+            
+            -- Cantidad de médicos distintos
+            COUNT(DISTINCT hv.MEDTRATANTE_RUT) AS HV_N_MEDICOS_U15D,
+            
+            -- Flags de tipos de prestaciones
+            MAX(CASE WHEN UPPER(hv.TIPO) = 'HOSPITALARIO' THEN 1 ELSE 0 END) AS HV_FLAG_HOSPITALARIO_U15D,
+            MAX(CASE WHEN UPPER(hv.TIPO) = 'BONO' THEN 1 ELSE 0 END) AS HV_FLAG_BONO_U15D,
+            MAX(CASE WHEN UPPER(hv.TIPO) = 'REEMBOLSO' THEN 1 ELSE 0 END) AS HV_FLAG_REEMBOLSO_U15D,
+            MAX(CASE WHEN hv.PATOLOGIA_GES = 'GES' THEN 1 ELSE 0 END) AS HV_FLAG_GES_U15D,
+            MAX(CASE WHEN hv.PATOLOGIA_CAEC = 'CAEC' THEN 1 ELSE 0 END) AS HV_FLAG_CAEC_U15D
+            
+        FROM licencias_rango base
+        LEFT JOIN OPX.P_DDV_OPX_MDPREDICTIVO.HV2 hv
+            ON base.AFILIADO_RUT = hv.COTIZANTE_RUT
+            AND hv.FECHA >= DATEADD(DAY, -15, base.FECHA_RECEPCION)
+            AND hv.FECHA < base.FECHA_RECEPCION
+            AND UPPER(hv.TIPO) IN ('HOSPITALARIO', 'BONO', 'REEMBOLSO')
+        GROUP BY base.AFILIADO_RUT, base.LCC_COMCOR, base.LCC_COMCOD
+    ),
+    metricas_peritajes AS (
+        SELECT 
+            base.AFILIADO_RUT,
+            base.LCC_COMCOR,
+            base.LCC_COMCOD,
+            
+            -- Total peritajes
+            COUNT(DISTINCT per.PERITAJE_PERITAJE_FECHA_CITACION) AS PERITAJES_TOTAL_U15D,
+            
+            -- Peritajes no asistidos
+            COUNT(DISTINCT CASE 
+                WHEN per.ASISTENCIA = 'NO ASISTE' 
+                THEN per.PERITAJE_PERITAJE_FECHA_CITACION 
+            END) AS PERITAJES_NO_ASISTE_U15D,
+            
+            -- Peritajes con desacuerdo
+            COUNT(DISTINCT CASE 
+                WHEN per.ASISTENCIA = 'ASISTE' 
+                AND per.ACUERDO_DESACUERDO = 'DESACUERDO'
+                THEN per.PERITAJE_PERITAJE_FECHA_CITACION 
+            END) AS PERITAJES_DESACUERDO_U15D,
+            
+            -- Peritajes con acuerdo
+            COUNT(DISTINCT CASE 
+                WHEN per.ASISTENCIA = 'ASISTE' 
+                AND per.ACUERDO_DESACUERDO = 'ACUERDO'
+                THEN per.PERITAJE_PERITAJE_FECHA_CITACION 
+            END) AS PERITAJES_ACUERDO_U15D,
+            
+            -- Días desde último peritaje
+            DATEDIFF(DAY, 
+                MAX(per.PERITAJE_PERITAJE_FECHA_CITACION),
+                base.FECHA_RECEPCION
+            ) AS DIAS_DESDE_ULTIMO_PERITAJE_U15D,
+            
+            -- Flag tuvo peritaje reciente
+            CASE 
+                WHEN COUNT(DISTINCT per.PERITAJE_PERITAJE_FECHA_CITACION) > 0 
+                THEN 1 ELSE 0 
+            END AS FLAG_PERITAJE_RECIENTE_U15D
+            
+        FROM licencias_rango base
+        LEFT JOIN OPX.P_DDV_OPX_MDPREDICTIVO.BASE_LM_PERITAJES_PROPAGADOS per
+            ON base.AFILIADO_RUT = per.AFILIADO_RUT
+            AND per.PERITAJE_PERITAJE_FECHA_CITACION >= DATEADD(DAY, -15, base.FECHA_RECEPCION)
+            AND per.PERITAJE_PERITAJE_FECHA_CITACION < base.FECHA_RECEPCION
+        GROUP BY base.AFILIADO_RUT, base.LCC_COMCOR, base.LCC_COMCOD, base.FECHA_RECEPCION
+    )
+    SELECT 
+        COALESCE(ml.AFILIADO_RUT, mh.AFILIADO_RUT, mp.AFILIADO_RUT) AS AFILIADO_RUT,
+        COALESCE(ml.LCC_COMCOR, mh.LCC_COMCOR, mp.LCC_COMCOR) AS LCC_COMCOR,
+        COALESCE(ml.LCC_COMCOD, mh.LCC_COMCOD, mp.LCC_COMCOD) AS LCC_COMCOD,
+        CURRENT_DATE() AS FECHA_CALCULO,
+        
+        -- Métricas de licencias
+        COALESCE(ml.CANT_LIC_U15D, 0) AS CANT_LIC_U15D,
+        COALESCE(ml.CANT_LIC_CON_RESOLUCION_U15D, 0) AS CANT_LIC_CON_RESOLUCION_U15D,
+        COALESCE(ml.COMPIN_RATIFICA_U15D, 0) AS COMPIN_RATIFICA_U15D,
+        COALESCE(ml.COMPIN_DENIEGA_U15D, 0) AS COMPIN_DENIEGA_U15D,
+        COALESCE(ml.F_DIAS_PROMEDIO_U15D, 0) AS F_DIAS_PROMEDIO_U15D,
+        COALESCE(ml.TOTAL_DIAS_SOLICITADOS_U15D, 0) AS TOTAL_DIAS_SOLICITADOS_U15D,
+        COALESCE(ml.MAX_DIAS_SOLICITADOS_U15D, 0) AS MAX_DIAS_SOLICITADOS_U15D,
+        COALESCE(ml.FLAG_MULTIPLES_LIC_U15D, 0) AS FLAG_MULTIPLES_LIC_U15D,
+        ml.RATIO_APROBACION_U15D,
+        
+        -- Métricas HV
+        COALESCE(mh.HV_N_PRESTACIONES_U15D, 0) AS HV_N_PRESTACIONES_U15D,
+        COALESCE(mh.HV_SUM_CANTIDAD_PREST_U15D, 0) AS HV_SUM_CANTIDAD_PREST_U15D,
+        COALESCE(mh.HV_N_MEDICOS_U15D, 0) AS HV_N_MEDICOS_U15D,
+        COALESCE(mh.HV_FLAG_HOSPITALARIO_U15D, 0) AS HV_FLAG_HOSPITALARIO_U15D,
+        COALESCE(mh.HV_FLAG_BONO_U15D, 0) AS HV_FLAG_BONO_U15D,
+        COALESCE(mh.HV_FLAG_REEMBOLSO_U15D, 0) AS HV_FLAG_REEMBOLSO_U15D,
+        COALESCE(mh.HV_FLAG_GES_U15D, 0) AS HV_FLAG_GES_U15D,
+        COALESCE(mh.HV_FLAG_CAEC_U15D, 0) AS HV_FLAG_CAEC_U15D,
+        
+        -- Métricas peritajes
+        COALESCE(mp.PERITAJES_TOTAL_U15D, 0) AS PERITAJES_TOTAL_U15D,
+        COALESCE(mp.PERITAJES_NO_ASISTE_U15D, 0) AS PERITAJES_NO_ASISTE_U15D,
+        COALESCE(mp.PERITAJES_DESACUERDO_U15D, 0) AS PERITAJES_DESACUERDO_U15D,
+        COALESCE(mp.PERITAJES_ACUERDO_U15D, 0) AS PERITAJES_ACUERDO_U15D,
+        COALESCE(mp.DIAS_DESDE_ULTIMO_PERITAJE_U15D, 9999) AS DIAS_DESDE_ULTIMO_PERITAJE_U15D,
+        COALESCE(mp.FLAG_PERITAJE_RECIENTE_U15D, 0) AS FLAG_PERITAJE_RECIENTE_U15D
+
+    FROM metricas_licencias ml
+    FULL OUTER JOIN metricas_hv mh
+        ON ml.AFILIADO_RUT = mh.AFILIADO_RUT
+        AND ml.LCC_COMCOR = mh.LCC_COMCOR
+        AND ml.LCC_COMCOD = mh.LCC_COMCOD
+    FULL OUTER JOIN metricas_peritajes mp
+        ON COALESCE(ml.AFILIADO_RUT, mh.AFILIADO_RUT) = mp.AFILIADO_RUT
+        AND COALESCE(ml.LCC_COMCOR, mh.LCC_COMCOR) = mp.LCC_COMCOR
+        AND COALESCE(ml.LCC_COMCOD, mh.LCC_COMCOD) = mp.LCC_COMCOD
+) AS source
+ON target.AFILIADO_RUT = source.AFILIADO_RUT 
+   AND target.LCC_COMCOR = source.LCC_COMCOR
+   AND target.LCC_COMCOD = source.LCC_COMCOD
+WHEN MATCHED THEN
+    UPDATE SET
+        FECHA_CALCULO = source.FECHA_CALCULO,
+        CANT_LIC_U15D = source.CANT_LIC_U15D,
+        CANT_LIC_CON_RESOLUCION_U15D = source.CANT_LIC_CON_RESOLUCION_U15D,
+        COMPIN_RATIFICA_U15D = source.COMPIN_RATIFICA_U15D,
+        COMPIN_DENIEGA_U15D = source.COMPIN_DENIEGA_U15D,
+        F_DIAS_PROMEDIO_U15D = source.F_DIAS_PROMEDIO_U15D,
+        TOTAL_DIAS_SOLICITADOS_U15D = source.TOTAL_DIAS_SOLICITADOS_U15D,
+        MAX_DIAS_SOLICITADOS_U15D = source.MAX_DIAS_SOLICITADOS_U15D,
+        FLAG_MULTIPLES_LIC_U15D = source.FLAG_MULTIPLES_LIC_U15D,
+        RATIO_APROBACION_U15D = source.RATIO_APROBACION_U15D,
+        HV_N_PRESTACIONES_U15D = source.HV_N_PRESTACIONES_U15D,
+        HV_SUM_CANTIDAD_PREST_U15D = source.HV_SUM_CANTIDAD_PREST_U15D,
+        HV_N_MEDICOS_U15D = source.HV_N_MEDICOS_U15D,
+        HV_FLAG_HOSPITALARIO_U15D = source.HV_FLAG_HOSPITALARIO_U15D,
+        HV_FLAG_BONO_U15D = source.HV_FLAG_BONO_U15D,
+        HV_FLAG_REEMBOLSO_U15D = source.HV_FLAG_REEMBOLSO_U15D,
+        HV_FLAG_GES_U15D = source.HV_FLAG_GES_U15D,
+        HV_FLAG_CAEC_U15D = source.HV_FLAG_CAEC_U15D,
+        PERITAJES_TOTAL_U15D = source.PERITAJES_TOTAL_U15D,
+        PERITAJES_NO_ASISTE_U15D = source.PERITAJES_NO_ASISTE_U15D,
+        PERITAJES_DESACUERDO_U15D = source.PERITAJES_DESACUERDO_U15D,
+        PERITAJES_ACUERDO_U15D = source.PERITAJES_ACUERDO_U15D,
+        DIAS_DESDE_ULTIMO_PERITAJE_U15D = source.DIAS_DESDE_ULTIMO_PERITAJE_U15D,
+        FLAG_PERITAJE_RECIENTE_U15D = source.FLAG_PERITAJE_RECIENTE_U15D
+WHEN NOT MATCHED THEN
+    INSERT (AFILIADO_RUT, LCC_COMCOR, LCC_COMCOD, FECHA_CALCULO,
+            CANT_LIC_U15D, CANT_LIC_CON_RESOLUCION_U15D, COMPIN_RATIFICA_U15D,
+            COMPIN_DENIEGA_U15D, F_DIAS_PROMEDIO_U15D, TOTAL_DIAS_SOLICITADOS_U15D,
+            MAX_DIAS_SOLICITADOS_U15D, FLAG_MULTIPLES_LIC_U15D, RATIO_APROBACION_U15D,
+            HV_N_PRESTACIONES_U15D, HV_SUM_CANTIDAD_PREST_U15D, HV_N_MEDICOS_U15D,
+            HV_FLAG_HOSPITALARIO_U15D, HV_FLAG_BONO_U15D, HV_FLAG_REEMBOLSO_U15D,
+            HV_FLAG_GES_U15D, HV_FLAG_CAEC_U15D, PERITAJES_TOTAL_U15D,
+            PERITAJES_NO_ASISTE_U15D, PERITAJES_DESACUERDO_U15D, PERITAJES_ACUERDO_U15D,
+            DIAS_DESDE_ULTIMO_PERITAJE_U15D, FLAG_PERITAJE_RECIENTE_U15D)
+    VALUES (source.AFILIADO_RUT, source.LCC_COMCOR, source.LCC_COMCOD, source.FECHA_CALCULO,
+            source.CANT_LIC_U15D, source.CANT_LIC_CON_RESOLUCION_U15D, source.COMPIN_RATIFICA_U15D,
+            source.COMPIN_DENIEGA_U15D, source.F_DIAS_PROMEDIO_U15D, source.TOTAL_DIAS_SOLICITADOS_U15D,
+            source.MAX_DIAS_SOLICITADOS_U15D, source.FLAG_MULTIPLES_LIC_U15D, source.RATIO_APROBACION_U15D,
+            source.HV_N_PRESTACIONES_U15D, source.HV_SUM_CANTIDAD_PREST_U15D, source.HV_N_MEDICOS_U15D,
+            source.HV_FLAG_HOSPITALARIO_U15D, source.HV_FLAG_BONO_U15D, source.HV_FLAG_REEMBOLSO_U15D,
+            source.HV_FLAG_GES_U15D, source.HV_FLAG_CAEC_U15D, source.PERITAJES_TOTAL_U15D,
+            source.PERITAJES_NO_ASISTE_U15D, source.PERITAJES_DESACUERDO_U15D, source.PERITAJES_ACUERDO_U15D,
+            source.DIAS_DESDE_ULTIMO_PERITAJE_U15D, source.FLAG_PERITAJE_RECIENTE_U15D);
+
+-- =====================================================
+
+-- =====================================================
+-- INSERCIÓN (RANGO DE 3 DÍAS) EN TABLA OPTIMIZADA
+-- =====================================================
+-- Este script inserta en MODELO_LM_202507_OPTIMIZADO las licencias
+-- procesadas en el rango objetivo, uniendo con las tablas de métricas actualizadas
+-- IMPORTANTE: Replica exactamente las 284 columnas de la tabla OPTIMIZADO
+-- =====================================================
+
+-- Insertar solo las licencias nuevas del rango objetivo
+INSERT INTO OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_OPTIMIZADO (
+    AFILIADO_RUT,
+    LCC_COMCOD,
+    LCC_COMCOR,
+    LCC_OPERADOR,
+    PRESTADOR_RUT,
+    EMPLEADOR_RUT,
+    "lic_id_licencia",
+    EPISODIO_ACUM_DIAS,
+    EPISODIO_FEC_INI,
+    CONTINUA_CALC,
+    TIPO_F_LM_COD,
+    TIPO_F_LM,
+    FECHA_RECEPCION,
+    FECHA_INICIO,
+    FECHA_TERMINO,
+    DIASSOLICITADO,
+    CIE_F,
+    CIE_F_COD,
+    CIE_GRUPO,
+    LM_DIAGNOSTICO,
+    LM_ANTECEDENTES_CLINICOS,
+    MED_CLASIFICACION,
+    MED_ESPECIALIDAD_LME,
+    EMPLEADOR_MULTIEMPLEADO,
+    COMUNA_REPOSO,
+    COMUNA_EMISION,
+    CALIDAD_TRABAJADOR,
+    LM_FORMATO,
+    LM_REPOSO_TIPO,
+    N_LICENCIA,
+    "lic_rut_trabajador",
+    "lic_dv_trabajador",
+    FECHA_EMISION_DT,
+    "lic_fecha_inicio_reposo",
+    "lic_fecha_recep_isapre",
+    "lic_dias_licencia",
+    "lic_codigo_tipo_licencia",
+    FECHA_EMP_RECEPCION,
+    FECHA_EMP_ENVIO,
+    "lic_rut_profesional",
+    "lic_pro_especialidad",
+    "lic_pro_tipo",
+    "lic_pro_dir_comuna",
+    "lic_diag_principal",
+    "lic_cie10_principal",
+    "lic_antecedentes_clinicos",
+    "lic_rut_empleador",
+    "lic_codigo_calidad_trab",
+    "lic_codigo_tipo_reposo",
+    COT_GENERO,
+    COT_EDAD,
+    "lic_reposo_dir_comuna1",
+    PRESTADOR_LOCAL_RUT,
+    PRESTADOR_LOCAL_TIPO_COD,
+    PRESTADOR_LOCAL_TIPO,
+    COMPIN_CNT,
+    FECHA_INICIO_BENEFICIOS,
+    FECHA_SUSCR_CONTRATO,
+    DEUDA_SIN_I,
+    DEUDA_SIN_I_ULT12M,
+    RENTA_ESTIMADA,
+    CTD_ENVIA_PERITAJE,
+    PERITAJE_LM_PERITADA,
+    PERITAJE_FALLO_1,
+    CTD_ENVIA_INFORME_MEDICO,
+    MEDICO_COLMENA,
+    REC_LCC_VISJUS,
+    REC_GLS_CAUMOD,
+    IS_REPOSO_INJUSTIFICADO_ISAPRE_FLAG,
+    RESOLUCION_COMPIN,
+    FECHA_ENVIO_A_COMPIN,
+    FECHA_RESOLUCION_COMPIN,
+    EXISTE_RESOL_COMPIN,
+    TIEMPO_RESOLUCION_COMPIN_CURRENT,
+    PRESTADOR_ESPECIALIDAD_PSC,
+    PREST_TOP_CIE_F,
+    PREST_TOP_GRUPOCIE,
+    PRESTADOR_TIPO,
+    FECHA_INGRESO_PREST,
+    FECHA_VISACION,
+    I_DIASAUTORIZADOS,
+    FECHA_RECONSIDERACION,
+    M_DIASAUTORIZADOS,
+    F_DIASAUTORIZADOS,
+    I_RESOLUCION,
+    LCC_PAGDIA,
+    ESTADO_LM,
+    IS_SIN_SUBSIDIO_FLAG,
+    IS_RECHAZADA_ISAPRE_CURRENT_FLAG,
+    IS_MODIFICADA_REAL_ISAPRE_FLAG,
+    DIAS_REDUCIDOS_ISAPRE_CURRENT,
+    IS_MODIFICADA_ISAPRE_FLAG,
+    IS_PSIQUIATRICA_CURRENT_FLAG,
+    DIFF_DIAS_PERDIDOS_RESOL_CURRENT,
+    RN_AFILIADO_HIST,
+    COMPIN_RATIFICA_01,
+    COMPIN_RATIFICA_06,
+    COMPIN_RATIFICA_12,
+    COMPIN_RATIFICA_24,
+    F_DIAS_PROMEDIO_U1M,
+    F_DIAS_MINIMO_U6M,
+    F_DIAS_MINIMO_U12M,
+    F_DIAS_MINIMO_U24M,
+    F_DIAS_PROMEDIO_U6M,
+    F_DIAS_PROMEDIO_U12M,
+    F_DIAS_PROMEDIO_U24M,
+    F_DIAS_PROMEDIO_U36M,
+    F_DIAS_MAXIMO_U6M,
+    DIFF_DIAS_PERDIDOS_RESOL_MINIMO_U6M,
+    DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U6M,
+    DIFF_DIAS_PERDIDOS_RESOL_MAXIMO_U6M,
+    DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U12M,
+    DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U24M,
+    DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U36M,
+    TIEMPO_PROMEDIO_RESOLUCION_COMPIN_01,
+    TIEMPO_PROMEDIO_RESOLUCION_COMPIN_06,
+    TIEMPO_PROMEDIO_RESOLUCION_COMPIN_12,
+    TIEMPO_PROMEDIO_RESOLUCION_COMPIN_24,
+    TIEMPO_PROMEDIO_RESOLUCION_COMPIN_36,
+    LM_DENEGADAS_COMPIN_01,
+    LM_DENEGADAS_COMPIN_06,
+    LM_DENEGADAS_COMPIN_12,
+    LM_DENEGADAS_COMPIN_36,
+    SIN_SUBSIDIO_01,
+    SIN_SUBSIDIO_12,
+    SIN_SUBSIDIO_24,
+    SIN_SUBSIDIO_36,
+    CAUSA_RECHAZO_ISAPRE_REPOSO_INJ_06,
+    CAUSA_RECHAZO_ISAPRE_REPOSO_INJ_12,
+    CANT_LIC_U1M_CALC,
+    CANT_LIC_U6M_CALC,
+    CANT_LIC_U12M_CALC,
+    CANT_LIC_U24M_CALC,
+    CANT_LIC_U36M_CALC,
+    DIASSOLICITADO_TOTAL_U1M,
+    DIASSOLICITADO_TOTAL_U6M,
+    DIASSOLICITADO_TOTAL_U12M,
+    DIASSOLICITADO_TOTAL_U24M,
+    DIASSOLICITADO_TOTAL_U36M,
+    DIASSOLICITADO_PROMEDIO_U1M,
+    DIASSOLICITADO_PROMEDIO_U6M,
+    DIASSOLICITADO_PROMEDIO_U12M,
+    DIASSOLICITADO_PROMEDIO_U24M,
+    DIASSOLICITADO_MAXIMO_U1M,
+    DIASSOLICITADO_MAXIMO_U6M,
+    DIASSOLICITADO_MAXIMO_U12M,
+    M_DIASAUTORIZADOS_PROMEDIO_U1M,
+    M_DIASAUTORIZADOS_MINIMO_U1M,
+    M_DIASAUTORIZADOS_MAXIMO_U1M,
+    M_DIASAUTORIZADOS_TOTAL_U1M,
+    M_DIASAUTORIZADOS_PROMEDIO_U6M,
+    M_DIASAUTORIZADOS_MINIMO_U6M,
+    M_DIASAUTORIZADOS_MAXIMO_U6M,
+    M_DIASAUTORIZADOS_TOTAL_U6M,
+    M_DIASAUTORIZADOS_PROMEDIO_U12M,
+    M_DIASAUTORIZADOS_MAXIMO_U12M,
+    M_DIASAUTORIZADOS_TOTAL_U12M,
+    M_DIASAUTORIZADOS_PROMEDIO_U24M,
+    M_DIASAUTORIZADOS_MAXIMO_U24M,
+    M_DIASAUTORIZADOS_PROMEDIO_U36M,
+    I_DIASAUTORIZADOS_PROMEDIO_U1M,
+    I_DIASAUTORIZADOS_MINIMO_U1M,
+    I_DIASAUTORIZADOS_MAXIMO_U1M,
+    I_DIASAUTORIZADOS_TOTAL_U1M,
+    I_DIASAUTORIZADOS_PROMEDIO_U6M,
+    I_DIASAUTORIZADOS_MINIMO_U6M,
+    I_DIASAUTORIZADOS_MAXIMO_U6M,
+    I_DIASAUTORIZADOS_TOTAL_U6M,
+    I_DIASAUTORIZADOS_PROMEDIO_U12M,
+    I_DIASAUTORIZADOS_MAXIMO_U12M,
+    I_DIASAUTORIZADOS_TOTAL_U12M,
+    I_DIASAUTORIZADOS_PROMEDIO_U24M,
+    I_DIASAUTORIZADOS_MAXIMO_U24M,
+    I_DIASAUTORIZADOS_PROMEDIO_U36M,
+    CIE_GRUPO_PSIQUIATRICAS_01,
+    CIE_GRUPO_PSIQUIATRICAS_06,
+    CIE_GRUPO_PSIQUIATRICAS_12,
+    CIE_GRUPO_PSIQUIATRICAS_24,
+    CIE_GRUPO_PSIQUIATRICAS_36,
+    PORCENTAJE_LM_MODIFICADA_01,
+    PORCENTAJE_LM_MODIFICADA_06,
+    PORCENTAJE_LM_MODIFICADA_12,
+    PORCENTAJE_LM_MODIFICADA_24,
+    PORCENTAJE_LM_MODIFICADA_36,
+    LM_MODIFICADA_01,
+    LM_MODIFICADA_06,
+    LM_MODIFICADA_12,
+    LM_MODIFICADA_24,
+    LM_MODIFICADA_36,
+    LM_TIPO_ENF_COMUN_12,
+    LM_TIPO_ENF_COMUN_24,
+    LM_TIPO_ENF_COMUN_36,
+    LM_CON_PERITAJE_12,
+    CTD_ENVIA_PERITAJE_PROMEDIO_U12M,
+    CTD_ENVIA_INFORME_MEDICO_PROMEDIO_U12M,
+    CTD_ENVIA_PERITAJE_U12M,
+    HIST_HV_N_PRESTACIONES_U6M,
+    HIST_HV_N_MEDICOS_U6M,
+    HIST_HV_SUM_CANTIDAD_PREST_U6M,
+    HIST_HV_N_HOSP_U6M,
+    HIST_HV_N_CONSULTAS_AMB_U6M,
+    HIST_HV_DIAS_CAMA_U6M,
+    HIST_HV_FLAG_GES_U6M,
+    HIST_HV_FLAG_CAEC_U6M,
+    HIST_HV_BONIFICADO_U6M,
+    HIST_HV_N_PRESTACIONES_U12M,
+    HIST_HV_DIAS_CAMA_U12M,
+    HIST_HV_FLAG_GES_U12M,
+    HIST_PERITAJES_NO_ASISTE_U6M,
+    HIST_PERITAJES_NO_ASISTE_U3M,
+    HIST_PERITAJES_DESACUERDO_ISAPRE_U12M,
+    HIST_TOTAL_PERITAJES_U12M,
+    HIST_PERITAJES_ISAPRE_GANO_U6M,
+    HIST_DIAS_DESDE_ULTIMO_PERITAJE,
+    MEDICO_LM_RECHAZADAS_ISAPRE_U1M,
+    MEDICO_LM_RECHAZADAS_ISAPRE_U6M,
+    MEDICO_LM_RECHAZADAS_ISAPRE_U12M,
+    MEDICO_LM_RECHAZADAS_ISAPRE_U24M,
+    MEDICO_LM_RECHAZADAS_ISAPRE_U36M,
+    MEDICO_LM_RECIBIDAS_TOTAL_U1M,
+    MEDICO_LM_RECIBIDAS_TOTAL_U6M,
+    MEDICO_LM_RECIBIDAS_TOTAL_U12M,
+    MEDICO_LM_RECIBIDAS_TOTAL_U24M,
+    MEDICO_LM_RECIBIDAS_TOTAL_U36M,
+    MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_U1M,
+    MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_U6M,
+    MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_U12M,
+    MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_U24M,
+    MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_U36M,
+    MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_U1M,
+    MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_U6M,
+    MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_U12M,
+    MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_U24M,
+    MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_U36M,
+    MEDICO_TASA_RATIFICACION_COMPIN_U6M,
+    MEDICO_TASA_RATIFICACION_COMPIN_U12M,
+    MEDICO_TASA_RATIFICACION_COMPIN_U24M,
+    MEDICO_TASA_RATIFICACION_COMPIN_U36M,
+    HIST_PERITAJES_DESACUERDO_ISAPRE_MEDICO_U12M,
+    HIST_PERITAJE_FAVORABLE_ISAPRE_MISMO_CIE_U3M,
+    HIST_HV_CONSULTAS_MISMO_MEDICO_U1M,
+    HIST_HV_CONSULTAS_MISMO_MEDICO_U3M,
+    HIST_HV_CONSULTAS_MISMO_MEDICO_U6M,
+    HIST_HV_TUVO_CONSULTA_MISMO_MEDICO_U12M,
+    HIST_HV_EXAMENES_LAB_MISMO_MEDICO_U7D,
+    HIST_HV_EXAMENES_LAB_MISMO_MEDICO_U14D,
+    HIST_HV_EXAMENES_LAB_MISMO_MEDICO_U30D,
+    HIST_HV_TUVO_EXAMENES_LAB_MISMO_MEDICO,
+    PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_U1M,
+    PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_U6M,
+    PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_U12M,
+    PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_U24M,
+    PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_U36M,
+    PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_U1M,
+    PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_U6M,
+    PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_U12M,
+    PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_U24M,
+    PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_U36M,
+    PRESTADOR_LOCAL_DIAS_SOLICITADOS_U1M,
+    PRESTADOR_LOCAL_DIAS_SOLICITADOS_U6M,
+    PRESTADOR_LOCAL_DIAS_SOLICITADOS_U12M,
+    PRESTADOR_LOCAL_DIAS_SOLICITADOS_U24M,
+    PRESTADOR_LOCAL_DIAS_SOLICITADOS_U36M,
+    EMPLEADOR_TASA_RECHAZO_ISAPRE_U1M,
+    EMPLEADOR_TASA_RECHAZO_ISAPRE_U6M,
+    EMPLEADOR_TASA_RECHAZO_ISAPRE_U12M,
+    EMPLEADOR_TASA_RECHAZO_ISAPRE_U36M,
+    EMPLEADOR_DIAS_SOLICITADOS_LM_U1M,
+    EMPLEADOR_DIAS_SOLICITADOS_LM_U6M,
+    EMPLEADOR_DIAS_SOLICITADOS_LM_U12M,
+    EMPLEADOR_DIAS_SOLICITADOS_LM_U36M,
+    EMPLEADOR_RUT_DISTINTOS_LM_U36M,
+    EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_U1M,
+    EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_U6M,
+    EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_U12M,
+    EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_U36M,
+    ISAP_RECHAZA,
+    ISAP_APRUEBA,
+    ISAP_MODIFICA_PCT,
+    ISAP_PIDE_PE,
+    ISAP_GANA_COMPIN,
+    CANT_LIC_U15D,
+    CANT_LIC_CON_RESOLUCION_U15D,
+    COMPIN_RATIFICA_U15D,
+    COMPIN_DENIEGA_U15D,
+    F_DIAS_PROMEDIO_U15D,
+    TOTAL_DIAS_SOLICITADOS_U15D,
+    MAX_DIAS_SOLICITADOS_U15D,
+    FLAG_MULTIPLES_LIC_U15D,
+    RATIO_APROBACION_U15D,
+    HV_N_PRESTACIONES_U15D,
+    HV_SUM_CANTIDAD_PREST_U15D,
+    HV_N_MEDICOS_U15D,
+    HV_FLAG_HOSPITALARIO_U15D,
+    HV_FLAG_BONO_U15D,
+    HV_FLAG_REEMBOLSO_U15D,
+    HV_FLAG_GES_U15D,
+    HV_FLAG_CAEC_U15D,
+    PERITAJES_TOTAL_U15D,
+    PERITAJES_NO_ASISTE_U15D,
+    PERITAJES_DESACUERDO_U15D,
+    PERITAJES_ACUERDO_U15D,
+    DIAS_DESDE_ULTIMO_PERITAJE_U15D,
+    FLAG_PERITAJE_RECIENTE_U15D,
+    PASO_FASTTRACK
+)
+WITH licencias_rango AS (
+    SELECT * 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE
+    WHERE DATE_TRUNC('DAY', FECHA_RECEPCION) BETWEEN $start_date AND $end_date
+),
+
+-- Métricas de licencias últimos 15 días
+metricas_15d AS (
+    SELECT 
+        base.AFILIADO_RUT,
+        base.LCC_COMCOR,
+        base.LCC_COMCOD,
+        base.FECHA_RECEPCION,
+        
+        COUNT(DISTINCT hist.LCC_COMCOR) AS CANT_LIC_U15D,
+        
+        COUNT(DISTINCT CASE 
+            WHEN hist.FECHA_RESOLUCION_COMPIN IS NOT NULL 
+            THEN hist.LCC_COMCOR 
+        END) AS CANT_LIC_CON_RESOLUCION_U15D,
+        
+        COUNT(DISTINCT CASE 
+            WHEN UPPER(hist.RESOLUCION_COMPIN) = 'RATIFICA' 
+            THEN hist.LCC_COMCOR 
+        END) AS COMPIN_RATIFICA_U15D,
+        
+        COUNT(DISTINCT CASE 
+            WHEN UPPER(hist.RESOLUCION_COMPIN) = 'DENIEGA' 
+            THEN hist.LCC_COMCOR 
+        END) AS COMPIN_DENIEGA_U15D,
+        
+        AVG(CASE 
+            WHEN hist.F_DIASAUTORIZADOS > 0 
+            THEN hist.F_DIASAUTORIZADOS 
+        END) AS F_DIAS_PROMEDIO_U15D,
+        
+        SUM(hist.DIASSOLICITADO) AS TOTAL_DIAS_SOLICITADOS_U15D,
+        MAX(hist.DIASSOLICITADO) AS MAX_DIAS_SOLICITADOS_U15D,
+        
+        CASE 
+            WHEN COUNT(DISTINCT hist.LCC_COMCOR) > 1 
+            THEN 1 ELSE 0 
+        END AS FLAG_MULTIPLES_LIC_U15D,
+        
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN hist.RESOLUCION_COMPIN IS NOT NULL THEN hist.LCC_COMCOR END) > 0
+            THEN COUNT(DISTINCT CASE WHEN UPPER(hist.RESOLUCION_COMPIN) = 'RATIFICA' THEN hist.LCC_COMCOR END) * 1.0 /
+                 COUNT(DISTINCT CASE WHEN hist.RESOLUCION_COMPIN IS NOT NULL THEN hist.LCC_COMCOR END)
+            ELSE NULL
+        END AS RATIO_APROBACION_U15D
+        
+    FROM licencias_rango base
+    LEFT JOIN OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE hist
+        ON base.AFILIADO_RUT = hist.AFILIADO_RUT
+        AND hist.FECHA_RECEPCION >= DATEADD(DAY, -15, base.FECHA_RECEPCION)
+        AND hist.FECHA_RECEPCION < base.FECHA_RECEPCION
+    GROUP BY 
+        base.AFILIADO_RUT,
+        base.LCC_COMCOR,
+        base.LCC_COMCOD,
+        base.FECHA_RECEPCION
+),
+
+-- Métricas HV últimos 15 días
+metricas_hv_15d AS (
+    SELECT 
+        base.AFILIADO_RUT,
+        base.LCC_COMCOR,
+        base.LCC_COMCOD,
+        
+        COUNT(DISTINCT hv.FOLIO) AS HV_N_PRESTACIONES_U15D,
+        SUM(hv.PRESTACION_CANTIDAD) AS HV_SUM_CANTIDAD_PREST_U15D,
+        COUNT(DISTINCT hv.MEDTRATANTE_RUT) AS HV_N_MEDICOS_U15D,
+        
+        MAX(CASE WHEN UPPER(hv.TIPO) = 'HOSPITALARIO' THEN 1 ELSE 0 END) AS HV_FLAG_HOSPITALARIO_U15D,
+        MAX(CASE WHEN UPPER(hv.TIPO) = 'BONO' THEN 1 ELSE 0 END) AS HV_FLAG_BONO_U15D,
+        MAX(CASE WHEN UPPER(hv.TIPO) = 'REEMBOLSO' THEN 1 ELSE 0 END) AS HV_FLAG_REEMBOLSO_U15D,
+        MAX(CASE WHEN hv.PATOLOGIA_GES = 'GES' THEN 1 ELSE 0 END) AS HV_FLAG_GES_U15D,
+        MAX(CASE WHEN hv.PATOLOGIA_CAEC = 'CAEC' THEN 1 ELSE 0 END) AS HV_FLAG_CAEC_U15D
+        
+    FROM licencias_rango base
+    LEFT JOIN OPX.P_DDV_OPX_MDPREDICTIVO.HV2 hv
+        ON base.AFILIADO_RUT = hv.COTIZANTE_RUT
+        AND hv.FECHA >= DATEADD(DAY, -15, base.FECHA_RECEPCION)
+        AND hv.FECHA < base.FECHA_RECEPCION
+        AND UPPER(hv.TIPO) IN ('HOSPITALARIO', 'BONO', 'REEMBOLSO')
+    GROUP BY 
+        base.AFILIADO_RUT,
+        base.LCC_COMCOR,
+        base.LCC_COMCOD
+),
+
+-- Métricas peritajes últimos 15 días
+metricas_peritajes_15d AS (
+    SELECT 
+        base.AFILIADO_RUT,
+        base.LCC_COMCOR,
+        base.LCC_COMCOD,
+        base.FECHA_RECEPCION,
+        
+        COUNT(DISTINCT per.PERITAJE_PERITAJE_FECHA_CITACION) AS PERITAJES_TOTAL_U15D,
+        
+        COUNT(DISTINCT CASE 
+            WHEN per.ASISTENCIA = 'NO ASISTE' 
+            THEN per.PERITAJE_PERITAJE_FECHA_CITACION 
+        END) AS PERITAJES_NO_ASISTE_U15D,
+        
+        COUNT(DISTINCT CASE 
+            WHEN per.ASISTENCIA = 'ASISTE' 
+            AND per.ACUERDO_DESACUERDO = 'DESACUERDO'
+            THEN per.PERITAJE_PERITAJE_FECHA_CITACION 
+        END) AS PERITAJES_DESACUERDO_U15D,
+        
+        COUNT(DISTINCT CASE 
+            WHEN per.ASISTENCIA = 'ASISTE' 
+            AND per.ACUERDO_DESACUERDO = 'ACUERDO'
+            THEN per.PERITAJE_PERITAJE_FECHA_CITACION 
+        END) AS PERITAJES_ACUERDO_U15D,
+        
+        DATEDIFF(DAY, 
+            MAX(per.PERITAJE_PERITAJE_FECHA_CITACION),
+            base.FECHA_RECEPCION
+        ) AS DIAS_DESDE_ULTIMO_PERITAJE_U15D,
+        
+        CASE 
+            WHEN COUNT(DISTINCT per.PERITAJE_PERITAJE_FECHA_CITACION) > 0 
+            THEN 1 ELSE 0 
+        END AS FLAG_PERITAJE_RECIENTE_U15D
+        
+    FROM licencias_rango base
+    LEFT JOIN OPX.P_DDV_OPX_MDPREDICTIVO.BASE_LM_PERITAJES_PROPAGADOS per
+        ON base.AFILIADO_RUT = per.AFILIADO_RUT
+        AND per.PERITAJE_PERITAJE_FECHA_CITACION >= DATEADD(DAY, -15, base.FECHA_RECEPCION)
+        AND per.PERITAJE_PERITAJE_FECHA_CITACION < base.FECHA_RECEPCION
+    GROUP BY 
+        base.AFILIADO_RUT,
+        base.LCC_COMCOR,
+        base.LCC_COMCOD,
+        base.FECHA_RECEPCION
+)
+
+SELECT
+    /* ===== TODOS LOS CAMPOS DE BASE (94 columnas) ===== */
+    m.AFILIADO_RUT,
+    m.LCC_COMCOD,
+    m.LCC_COMCOR,
+    m.LCC_OPERADOR,
+    m.PRESTADOR_RUT,
+    m.EMPLEADOR_RUT,
+    m."lic_id_licencia",
+    m.EPISODIO_ACUM_DIAS,
+    m.EPISODIO_FEC_INI,
+    m.CONTINUA_CALC,
+    m.TIPO_F_LM_COD,
+    m.TIPO_F_LM,
+    m.FECHA_RECEPCION,
+    m.FECHA_INICIO,
+    m.FECHA_TERMINO,
+    m.DIASSOLICITADO,
+    m.CIE_F,
+    m.CIE_F_COD,
+    m.CIE_GRUPO,
+    m.LM_DIAGNOSTICO,
+    m.LM_ANTECEDENTES_CLINICOS,
+    m.MED_CLASIFICACION,
+    m.MED_ESPECIALIDAD_LME,
+    m.EMPLEADOR_MULTIEMPLEADO,
+    m.COMUNA_REPOSO,
+    m.COMUNA_EMISION,
+    m.CALIDAD_TRABAJADOR,
+    m.LM_FORMATO,
+    m.LM_REPOSO_TIPO,
+    m.N_LICENCIA,
+    m."lic_rut_trabajador",
+    m."lic_dv_trabajador",
+    m.FECHA_EMISION_DT,
+    m."lic_fecha_inicio_reposo",
+    m."lic_fecha_recep_isapre",
+    m."lic_dias_licencia",
+    m."lic_codigo_tipo_licencia",
+    m.FECHA_EMP_RECEPCION,
+    m.FECHA_EMP_ENVIO,
+    m."lic_rut_profesional",
+    m."lic_pro_especialidad",
+    m."lic_pro_tipo",
+    m."lic_pro_dir_comuna",
+    m."lic_diag_principal",
+    m."lic_cie10_principal",
+    m."lic_antecedentes_clinicos",
+    m."lic_rut_empleador",
+    m."lic_codigo_calidad_trab",
+    m."lic_codigo_tipo_reposo",
+    m.COT_GENERO,
+    m.COT_EDAD,
+    m."lic_reposo_dir_comuna1",
+    m.PRESTADOR_LOCAL_RUT,
+    m.PRESTADOR_LOCAL_TIPO_COD,
+    m.PRESTADOR_LOCAL_TIPO,
+    m.COMPIN_CNT,
+    m.FECHA_INICIO_BENEFICIOS,
+    m.FECHA_SUSCR_CONTRATO,
+    m.DEUDA_SIN_I,
+    m.DEUDA_SIN_I_ULT12M,
+    m.RENTA_ESTIMADA,
+    m.CTD_ENVIA_PERITAJE,
+    m.PERITAJE_LM_PERITADA,
+    m.PERITAJE_FALLO_1,
+    m.CTD_ENVIA_INFORME_MEDICO,
+    m.MEDICO_COLMENA,
+    m.REC_LCC_VISJUS,
+    m.REC_GLS_CAUMOD,
+    m.IS_REPOSO_INJUSTIFICADO_ISAPRE_FLAG,
+    m.RESOLUCION_COMPIN,
+    m.FECHA_ENVIO_A_COMPIN,
+    m.FECHA_RESOLUCION_COMPIN,
+    m.EXISTE_RESOL_COMPIN,
+    m.TIEMPO_RESOLUCION_COMPIN_CURRENT,
+    m.PRESTADOR_ESPECIALIDAD_PSC,
+    m.PREST_TOP_CIE_F,
+    m.PREST_TOP_GRUPOCIE,
+    m.PRESTADOR_TIPO,
+    m.FECHA_INGRESO_PREST,
+    m.FECHA_VISACION,
+    m.I_DIASAUTORIZADOS,
+    m.FECHA_RECONSIDERACION,
+    m.M_DIASAUTORIZADOS,
+    m.F_DIASAUTORIZADOS,
+    m.I_RESOLUCION,
+    m.LCC_PAGDIA,
+    m.ESTADO_LM,
+    m.IS_SIN_SUBSIDIO_FLAG,
+    m.IS_RECHAZADA_ISAPRE_CURRENT_FLAG,
+    m.IS_MODIFICADA_REAL_ISAPRE_FLAG,
+    m.DIAS_REDUCIDOS_ISAPRE_CURRENT,
+    m.IS_MODIFICADA_ISAPRE_FLAG,
+    m.IS_PSIQUIATRICA_CURRENT_FLAG,
+    m.DIFF_DIAS_PERDIDOS_RESOL_CURRENT,
+    
+    /* ===== Row Number calculado para todo el histórico del afiliado ===== */
+    (SELECT COUNT(*) + 1 
+     FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_OPTIMIZADO opt_hist
+     WHERE opt_hist.AFILIADO_RUT = m.AFILIADO_RUT
+       AND (opt_hist.FECHA_RECEPCION < m.FECHA_RECEPCION
+            OR (opt_hist.FECHA_RECEPCION = m.FECHA_RECEPCION AND opt_hist.LCC_COMCOR < m.LCC_COMCOR)
+            OR (opt_hist.FECHA_RECEPCION = m.FECHA_RECEPCION AND opt_hist.LCC_COMCOR = m.LCC_COMCOR AND opt_hist.LCC_COMCOD < m.LCC_COMCOD))
+    ) AS RN_AFILIADO_HIST,
+    
+    /* ===== METRICAS DE AFILIADO desde tabla pre-agregada (incluye HV y Peritajes) ===== */
+    COALESCE(afi.COMPIN_RATIFICA_01, 0) AS COMPIN_RATIFICA_01,
+    COALESCE(afi.COMPIN_RATIFICA_06, 0) AS COMPIN_RATIFICA_06,
+    COALESCE(afi.COMPIN_RATIFICA_12, 0) AS COMPIN_RATIFICA_12,
+    COALESCE(afi.COMPIN_RATIFICA_24, 0) AS COMPIN_RATIFICA_24,
+    COALESCE(afi.F_DIAS_PROMEDIO_U1M, 0) AS F_DIAS_PROMEDIO_U1M,
+    COALESCE(afi.F_DIAS_MINIMO_U6M, 0) AS F_DIAS_MINIMO_U6M,
+    COALESCE(afi.F_DIAS_MINIMO_U12M, 0) AS F_DIAS_MINIMO_U12M,
+    COALESCE(afi.F_DIAS_MINIMO_U24M, 0) AS F_DIAS_MINIMO_U24M,
+    COALESCE(afi.F_DIAS_PROMEDIO_U6M, 0) AS F_DIAS_PROMEDIO_U6M,
+    COALESCE(afi.F_DIAS_PROMEDIO_U12M, 0) AS F_DIAS_PROMEDIO_U12M,
+    COALESCE(afi.F_DIAS_PROMEDIO_U24M, 0) AS F_DIAS_PROMEDIO_U24M,
+    COALESCE(afi.F_DIAS_PROMEDIO_U36M, 0) AS F_DIAS_PROMEDIO_U36M,
+    COALESCE(afi.F_DIAS_MAXIMO_U6M, 0) AS F_DIAS_MAXIMO_U6M,
+    COALESCE(afi.DIFF_DIAS_PERDIDOS_RESOL_MINIMO_U6M, 0) AS DIFF_DIAS_PERDIDOS_RESOL_MINIMO_U6M,
+    COALESCE(afi.DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U6M, 0) AS DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U6M,
+    COALESCE(afi.DIFF_DIAS_PERDIDOS_RESOL_MAXIMO_U6M, 0) AS DIFF_DIAS_PERDIDOS_RESOL_MAXIMO_U6M,
+    COALESCE(afi.DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U12M, 0) AS DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U12M,
+    COALESCE(afi.DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U24M, 0) AS DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U24M,
+    COALESCE(afi.DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U36M, 0) AS DIFF_DIAS_PERDIDOS_RESOL_PROMEDIO_U36M,
+    COALESCE(afi.TIEMPO_PROMEDIO_RESOLUCION_COMPIN_01, 0) AS TIEMPO_PROMEDIO_RESOLUCION_COMPIN_01,
+    COALESCE(afi.TIEMPO_PROMEDIO_RESOLUCION_COMPIN_06, 0) AS TIEMPO_PROMEDIO_RESOLUCION_COMPIN_06,
+    COALESCE(afi.TIEMPO_PROMEDIO_RESOLUCION_COMPIN_12, 0) AS TIEMPO_PROMEDIO_RESOLUCION_COMPIN_12,
+    COALESCE(afi.TIEMPO_PROMEDIO_RESOLUCION_COMPIN_24, 0) AS TIEMPO_PROMEDIO_RESOLUCION_COMPIN_24,
+    COALESCE(afi.TIEMPO_PROMEDIO_RESOLUCION_COMPIN_36, 0) AS TIEMPO_PROMEDIO_RESOLUCION_COMPIN_36,
+    COALESCE(afi.LM_DENEGADAS_COMPIN_01, 0) AS LM_DENEGADAS_COMPIN_01,
+    COALESCE(afi.LM_DENEGADAS_COMPIN_06, 0) AS LM_DENEGADAS_COMPIN_06,
+    COALESCE(afi.LM_DENEGADAS_COMPIN_12, 0) AS LM_DENEGADAS_COMPIN_12,
+    COALESCE(afi.LM_DENEGADAS_COMPIN_36, 0) AS LM_DENEGADAS_COMPIN_36,
+    COALESCE(afi.SIN_SUBSIDIO_01, 0) AS SIN_SUBSIDIO_01,
+    COALESCE(afi.SIN_SUBSIDIO_12, 0) AS SIN_SUBSIDIO_12,
+    COALESCE(afi.SIN_SUBSIDIO_24, 0) AS SIN_SUBSIDIO_24,
+    COALESCE(afi.SIN_SUBSIDIO_36, 0) AS SIN_SUBSIDIO_36,
+    COALESCE(afi.CAUSA_RECHAZO_ISAPRE_REPOSO_INJ_06, 0) AS CAUSA_RECHAZO_ISAPRE_REPOSO_INJ_06,
+    COALESCE(afi.CAUSA_RECHAZO_ISAPRE_REPOSO_INJ_12, 0) AS CAUSA_RECHAZO_ISAPRE_REPOSO_INJ_12,
+    COALESCE(afi.CANT_LIC_U1M_CALC, 0) AS CANT_LIC_U1M_CALC,
+    COALESCE(afi.CANT_LIC_U6M_CALC, 0) AS CANT_LIC_U6M_CALC,
+    COALESCE(afi.CANT_LIC_U12M_CALC, 0) AS CANT_LIC_U12M_CALC,
+    COALESCE(afi.CANT_LIC_U24M_CALC, 0) AS CANT_LIC_U24M_CALC,
+    COALESCE(afi.CANT_LIC_U36M_CALC, 0) AS CANT_LIC_U36M_CALC,
+    COALESCE(afi.DIASSOLICITADO_TOTAL_U1M, 0) AS DIASSOLICITADO_TOTAL_U1M,
+    COALESCE(afi.DIASSOLICITADO_TOTAL_U6M, 0) AS DIASSOLICITADO_TOTAL_U6M,
+    COALESCE(afi.DIASSOLICITADO_TOTAL_U12M, 0) AS DIASSOLICITADO_TOTAL_U12M,
+    COALESCE(afi.DIASSOLICITADO_TOTAL_U24M, 0) AS DIASSOLICITADO_TOTAL_U24M,
+    COALESCE(afi.DIASSOLICITADO_TOTAL_U36M, 0) AS DIASSOLICITADO_TOTAL_U36M,
+    COALESCE(afi.DIASSOLICITADO_PROMEDIO_U1M, 0) AS DIASSOLICITADO_PROMEDIO_U1M,
+    COALESCE(afi.DIASSOLICITADO_PROMEDIO_U6M, 0) AS DIASSOLICITADO_PROMEDIO_U6M,
+    COALESCE(afi.DIASSOLICITADO_PROMEDIO_U12M, 0) AS DIASSOLICITADO_PROMEDIO_U12M,
+    COALESCE(afi.DIASSOLICITADO_PROMEDIO_U24M, 0) AS DIASSOLICITADO_PROMEDIO_U24M,
+    COALESCE(afi.DIASSOLICITADO_MAXIMO_U1M, 0) AS DIASSOLICITADO_MAXIMO_U1M,
+    COALESCE(afi.DIASSOLICITADO_MAXIMO_U6M, 0) AS DIASSOLICITADO_MAXIMO_U6M,
+    COALESCE(afi.DIASSOLICITADO_MAXIMO_U12M, 0) AS DIASSOLICITADO_MAXIMO_U12M,
+    COALESCE(afi.M_DIASAUTORIZADOS_PROMEDIO_U1M, 0) AS M_DIASAUTORIZADOS_PROMEDIO_U1M,
+    COALESCE(afi.M_DIASAUTORIZADOS_MINIMO_U1M, 0) AS M_DIASAUTORIZADOS_MINIMO_U1M,
+    COALESCE(afi.M_DIASAUTORIZADOS_MAXIMO_U1M, 0) AS M_DIASAUTORIZADOS_MAXIMO_U1M,
+    COALESCE(afi.M_DIASAUTORIZADOS_TOTAL_U1M, 0) AS M_DIASAUTORIZADOS_TOTAL_U1M,
+    COALESCE(afi.M_DIASAUTORIZADOS_PROMEDIO_U6M, 0) AS M_DIASAUTORIZADOS_PROMEDIO_U6M,
+    COALESCE(afi.M_DIASAUTORIZADOS_MINIMO_U6M, 0) AS M_DIASAUTORIZADOS_MINIMO_U6M,
+    COALESCE(afi.M_DIASAUTORIZADOS_MAXIMO_U6M, 0) AS M_DIASAUTORIZADOS_MAXIMO_U6M,
+    COALESCE(afi.M_DIASAUTORIZADOS_TOTAL_U6M, 0) AS M_DIASAUTORIZADOS_TOTAL_U6M,
+    COALESCE(afi.M_DIASAUTORIZADOS_PROMEDIO_U12M, 0) AS M_DIASAUTORIZADOS_PROMEDIO_U12M,
+    COALESCE(afi.M_DIASAUTORIZADOS_MAXIMO_U12M, 0) AS M_DIASAUTORIZADOS_MAXIMO_U12M,
+    COALESCE(afi.M_DIASAUTORIZADOS_TOTAL_U12M, 0) AS M_DIASAUTORIZADOS_TOTAL_U12M,
+    COALESCE(afi.M_DIASAUTORIZADOS_PROMEDIO_U24M, 0) AS M_DIASAUTORIZADOS_PROMEDIO_U24M,
+    COALESCE(afi.M_DIASAUTORIZADOS_MAXIMO_U24M, 0) AS M_DIASAUTORIZADOS_MAXIMO_U24M,
+    COALESCE(afi.M_DIASAUTORIZADOS_PROMEDIO_U36M, 0) AS M_DIASAUTORIZADOS_PROMEDIO_U36M,
+    COALESCE(afi.I_DIASAUTORIZADOS_PROMEDIO_U1M, 0) AS I_DIASAUTORIZADOS_PROMEDIO_U1M,
+    COALESCE(afi.I_DIASAUTORIZADOS_MINIMO_U1M, 0) AS I_DIASAUTORIZADOS_MINIMO_U1M,
+    COALESCE(afi.I_DIASAUTORIZADOS_MAXIMO_U1M, 0) AS I_DIASAUTORIZADOS_MAXIMO_U1M,
+    COALESCE(afi.I_DIASAUTORIZADOS_TOTAL_U1M, 0) AS I_DIASAUTORIZADOS_TOTAL_U1M,
+    COALESCE(afi.I_DIASAUTORIZADOS_PROMEDIO_U6M, 0) AS I_DIASAUTORIZADOS_PROMEDIO_U6M,
+    COALESCE(afi.I_DIASAUTORIZADOS_MINIMO_U6M, 0) AS I_DIASAUTORIZADOS_MINIMO_U6M,
+    COALESCE(afi.I_DIASAUTORIZADOS_MAXIMO_U6M, 0) AS I_DIASAUTORIZADOS_MAXIMO_U6M,
+    COALESCE(afi.I_DIASAUTORIZADOS_TOTAL_U6M, 0) AS I_DIASAUTORIZADOS_TOTAL_U6M,
+    COALESCE(afi.I_DIASAUTORIZADOS_PROMEDIO_U12M, 0) AS I_DIASAUTORIZADOS_PROMEDIO_U12M,
+    COALESCE(afi.I_DIASAUTORIZADOS_MAXIMO_U12M, 0) AS I_DIASAUTORIZADOS_MAXIMO_U12M,
+    COALESCE(afi.I_DIASAUTORIZADOS_TOTAL_U12M, 0) AS I_DIASAUTORIZADOS_TOTAL_U12M,
+    COALESCE(afi.I_DIASAUTORIZADOS_PROMEDIO_U24M, 0) AS I_DIASAUTORIZADOS_PROMEDIO_U24M,
+    COALESCE(afi.I_DIASAUTORIZADOS_MAXIMO_U24M, 0) AS I_DIASAUTORIZADOS_MAXIMO_U24M,
+    COALESCE(afi.I_DIASAUTORIZADOS_PROMEDIO_U36M, 0) AS I_DIASAUTORIZADOS_PROMEDIO_U36M,
+    COALESCE(afi.CIE_GRUPO_PSIQUIATRICAS_01, 0) AS CIE_GRUPO_PSIQUIATRICAS_01,
+    COALESCE(afi.CIE_GRUPO_PSIQUIATRICAS_06, 0) AS CIE_GRUPO_PSIQUIATRICAS_06,
+    COALESCE(afi.CIE_GRUPO_PSIQUIATRICAS_12, 0) AS CIE_GRUPO_PSIQUIATRICAS_12,
+    COALESCE(afi.CIE_GRUPO_PSIQUIATRICAS_24, 0) AS CIE_GRUPO_PSIQUIATRICAS_24,
+    COALESCE(afi.CIE_GRUPO_PSIQUIATRICAS_36, 0) AS CIE_GRUPO_PSIQUIATRICAS_36,
+    COALESCE(afi.PORCENTAJE_LM_MODIFICADA_01, 0) AS PORCENTAJE_LM_MODIFICADA_01,
+    COALESCE(afi.PORCENTAJE_LM_MODIFICADA_06, 0) AS PORCENTAJE_LM_MODIFICADA_06,
+    COALESCE(afi.PORCENTAJE_LM_MODIFICADA_12, 0) AS PORCENTAJE_LM_MODIFICADA_12,
+    COALESCE(afi.PORCENTAJE_LM_MODIFICADA_24, 0) AS PORCENTAJE_LM_MODIFICADA_24,
+    COALESCE(afi.PORCENTAJE_LM_MODIFICADA_36, 0) AS PORCENTAJE_LM_MODIFICADA_36,
+    COALESCE(afi.LM_MODIFICADA_01, 0) AS LM_MODIFICADA_01,
+    COALESCE(afi.LM_MODIFICADA_06, 0) AS LM_MODIFICADA_06,
+    COALESCE(afi.LM_MODIFICADA_12, 0) AS LM_MODIFICADA_12,
+    COALESCE(afi.LM_MODIFICADA_24, 0) AS LM_MODIFICADA_24,
+    COALESCE(afi.LM_MODIFICADA_36, 0) AS LM_MODIFICADA_36,
+    COALESCE(afi.LM_TIPO_ENF_COMUN_12, 0) AS LM_TIPO_ENF_COMUN_12,
+    COALESCE(afi.LM_TIPO_ENF_COMUN_24, 0) AS LM_TIPO_ENF_COMUN_24,
+    COALESCE(afi.LM_TIPO_ENF_COMUN_36, 0) AS LM_TIPO_ENF_COMUN_36,
+    COALESCE(afi.LM_CON_PERITAJE_12, 0) AS LM_CON_PERITAJE_12,
+    COALESCE(afi.CTD_ENVIA_PERITAJE_PROMEDIO_U12M, 0) AS CTD_ENVIA_PERITAJE_PROMEDIO_U12M,
+    COALESCE(afi.CTD_ENVIA_INFORME_MEDICO_PROMEDIO_U12M, 0) AS CTD_ENVIA_INFORME_MEDICO_PROMEDIO_U12M,
+    COALESCE(afi.CTD_ENVIA_PERITAJE_U12M, 0) AS CTD_ENVIA_PERITAJE_U12M,
+    
+    -- Variables HV del afiliado
+    COALESCE(afi.HIST_HV_N_PRESTACIONES_u6m, 0) AS HIST_HV_N_PRESTACIONES_u6m,
+    COALESCE(afi.HIST_HV_N_MEDICOS_u6m, 0) AS HIST_HV_N_MEDICOS_u6m,
+    COALESCE(afi.HIST_HV_SUM_CANTIDAD_PREST_u6m, 0) AS HIST_HV_SUM_CANTIDAD_PREST_u6m,
+    COALESCE(afi.HIST_HV_N_HOSP_u6m, 0) AS HIST_HV_N_HOSP_u6m,
+    COALESCE(afi.HIST_HV_N_CONSULTAS_AMB_u6m, 0) AS HIST_HV_N_CONSULTAS_AMB_u6m,
+    COALESCE(afi.HIST_HV_DIAS_CAMA_u6m, 0) AS HIST_HV_DIAS_CAMA_u6m,
+    COALESCE(afi.HIST_HV_FLAG_GES_u6m, 0) AS HIST_HV_FLAG_GES_u6m,
+    COALESCE(afi.HIST_HV_FLAG_CAEC_u6m, 0) AS HIST_HV_FLAG_CAEC_u6m,
+    COALESCE(afi.HIST_HV_BONIFICADO_u6m, 0) AS HIST_HV_BONIFICADO_u6m,
+    COALESCE(afi.HIST_HV_N_PRESTACIONES_u12m, 0) AS HIST_HV_N_PRESTACIONES_u12m,
+    COALESCE(afi.HIST_HV_DIAS_CAMA_u12m, 0) AS HIST_HV_DIAS_CAMA_u12m,
+    COALESCE(afi.HIST_HV_FLAG_GES_u12m, 0) AS HIST_HV_FLAG_GES_u12m,
+    
+    -- Variables de peritajes del afiliado
+    COALESCE(afi.HIST_PERITAJES_NO_ASISTE_u6m, 0) AS HIST_PERITAJES_NO_ASISTE_u6m,
+    COALESCE(afi.HIST_PERITAJES_NO_ASISTE_u3m, 0) AS HIST_PERITAJES_NO_ASISTE_u3m,
+    COALESCE(afi.HIST_PERITAJES_DESACUERDO_ISAPRE_u12m, 0) AS HIST_PERITAJES_DESACUERDO_ISAPRE_u12m,
+    COALESCE(afi.HIST_TOTAL_PERITAJES_u12m, 0) AS HIST_TOTAL_PERITAJES_u12m,
+    COALESCE(afi.HIST_PERITAJES_ISAPRE_GANO_u6m, 0) AS HIST_PERITAJES_ISAPRE_GANO_u6m,
+    COALESCE(afi.HIST_DIAS_DESDE_ULTIMO_PERITAJE, 9999) AS HIST_DIAS_DESDE_ULTIMO_PERITAJE,
+    
+    /* ===== METRICAS DE MEDICO desde tabla pre-agregada (incluye peritajes del médico) ===== */
+    COALESCE(med.MEDICO_LM_RECHAZADAS_ISAPRE_u1m, 0) AS MEDICO_LM_RECHAZADAS_ISAPRE_u1m,
+    COALESCE(med.MEDICO_LM_RECHAZADAS_ISAPRE_u6m, 0) AS MEDICO_LM_RECHAZADAS_ISAPRE_u6m,
+    COALESCE(med.MEDICO_LM_RECHAZADAS_ISAPRE_u12m, 0) AS MEDICO_LM_RECHAZADAS_ISAPRE_u12m,
+    COALESCE(med.MEDICO_LM_RECHAZADAS_ISAPRE_u24m, 0) AS MEDICO_LM_RECHAZADAS_ISAPRE_u24m,
+    COALESCE(med.MEDICO_LM_RECHAZADAS_ISAPRE_u36m, 0) AS MEDICO_LM_RECHAZADAS_ISAPRE_u36m,
+    COALESCE(med.MEDICO_LM_RECIBIDAS_TOTAL_u1m, 0) AS MEDICO_LM_RECIBIDAS_TOTAL_u1m,
+    COALESCE(med.MEDICO_LM_RECIBIDAS_TOTAL_u6m, 0) AS MEDICO_LM_RECIBIDAS_TOTAL_u6m,
+    COALESCE(med.MEDICO_LM_RECIBIDAS_TOTAL_u12m, 0) AS MEDICO_LM_RECIBIDAS_TOTAL_u12m,
+    COALESCE(med.MEDICO_LM_RECIBIDAS_TOTAL_u24m, 0) AS MEDICO_LM_RECIBIDAS_TOTAL_u24m,
+    COALESCE(med.MEDICO_LM_RECIBIDAS_TOTAL_u36m, 0) AS MEDICO_LM_RECIBIDAS_TOTAL_u36m,
+    COALESCE(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u1m, 0) AS MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u1m,
+    COALESCE(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u6m, 0) AS MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u6m,
+    COALESCE(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u12m, 0) AS MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u12m,
+    COALESCE(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u24m, 0) AS MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u24m,
+    COALESCE(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u36m, 0) AS MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u36m,
+    
+    -- Ratios calculados para médico
+    DIV0(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u1m, med.MEDICO_DIAS_SOLICITADOS_u1m) AS MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_u1m,
+    DIV0(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u6m, med.MEDICO_DIAS_SOLICITADOS_u6m) AS MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_u6m,
+    DIV0(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u12m, med.MEDICO_DIAS_SOLICITADOS_u12m) AS MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_u12m,
+    DIV0(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u24m, med.MEDICO_DIAS_SOLICITADOS_u24m) AS MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_u24m,
+    DIV0(med.MEDICO_DIAS_MODIFICADOS_SUM_ISAPRE_u36m, med.MEDICO_DIAS_SOLICITADOS_u36m) AS MEDICO_DIAS_MODIFICADOS_PCT_ISAPRE_u36m,
+    DIV0(med.MEDICO_LM_RATIFICADAS_COMPIN_u6m, (med.MEDICO_LM_RATIFICADAS_COMPIN_u6m + med.MEDICO_LM_DENEGADAS_COMPIN_u6m)) AS MEDICO_TASA_RATIFICACION_COMPIN_u6m,
+    DIV0(med.MEDICO_LM_RATIFICADAS_COMPIN_u12m, (med.MEDICO_LM_RATIFICADAS_COMPIN_u12m + med.MEDICO_LM_DENEGADAS_COMPIN_u12m)) AS MEDICO_TASA_RATIFICACION_COMPIN_u12m,
+    DIV0(med.MEDICO_LM_RATIFICADAS_COMPIN_u24m, (med.MEDICO_LM_RATIFICADAS_COMPIN_u24m + med.MEDICO_LM_DENEGADAS_COMPIN_u24m)) AS MEDICO_TASA_RATIFICACION_COMPIN_u24m,
+    DIV0(med.MEDICO_LM_RATIFICADAS_COMPIN_u36m, (med.MEDICO_LM_RATIFICADAS_COMPIN_u36m + med.MEDICO_LM_DENEGADAS_COMPIN_u36m)) AS MEDICO_TASA_RATIFICACION_COMPIN_u36m,
+    
+    -- Variables de peritajes del médico
+    COALESCE(med.HIST_PERITAJES_DESACUERDO_ISAPRE_MEDICO_u12m, 0) AS HIST_PERITAJES_DESACUERDO_ISAPRE_MEDICO_u12m,
+    COALESCE(med.HIST_PERITAJE_FAVORABLE_ISAPRE_MISMO_CIE_u3m, 0) AS HIST_PERITAJE_FAVORABLE_ISAPRE_MISMO_CIE_u3m,
+    
+    -- Variables HV del médico (consultas y exámenes con el mismo médico)
+    COALESCE(med.HIST_HV_CONSULTAS_MISMO_MEDICO_u1m, 0) AS HIST_HV_CONSULTAS_MISMO_MEDICO_u1m,
+    COALESCE(med.HIST_HV_CONSULTAS_MISMO_MEDICO_u3m, 0) AS HIST_HV_CONSULTAS_MISMO_MEDICO_u3m,
+    COALESCE(med.HIST_HV_CONSULTAS_MISMO_MEDICO_u6m, 0) AS HIST_HV_CONSULTAS_MISMO_MEDICO_u6m,
+    COALESCE(med.HIST_HV_TUVO_CONSULTA_MISMO_MEDICO_u12m, 0) AS HIST_HV_TUVO_CONSULTA_MISMO_MEDICO_u12m,
+    COALESCE(med.HIST_HV_EXAMENES_LAB_MISMO_MEDICO_u7d, 0) AS HIST_HV_EXAMENES_LAB_MISMO_MEDICO_u7d,
+    COALESCE(med.HIST_HV_EXAMENES_LAB_MISMO_MEDICO_u14d, 0) AS HIST_HV_EXAMENES_LAB_MISMO_MEDICO_u14d,
+    COALESCE(med.HIST_HV_EXAMENES_LAB_MISMO_MEDICO_u30d, 0) AS HIST_HV_EXAMENES_LAB_MISMO_MEDICO_u30d,
+    COALESCE(med.HIST_HV_TUVO_EXAMENES_LAB_MISMO_MEDICO, 0) AS HIST_HV_TUVO_EXAMENES_LAB_MISMO_MEDICO,
+    
+    /* ===== METRICAS DE PRESTADOR_LOCAL desde tabla pre-agregada ===== */
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u1m, 0) AS PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u1m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u6m, 0) AS PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u6m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u12m, 0) AS PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u12m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u24m, 0) AS PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u24m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u36m, 0) AS PRESTADOR_LOCAL_LM_RECHAZADAS_ISAPRE_u36m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u1m, 0) AS PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u1m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u6m, 0) AS PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u6m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u12m, 0) AS PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u12m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u24m, 0) AS PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u24m,
+    COALESCE(plocal.PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u36m, 0) AS PRESTADOR_LOCAL_LM_RECIBIDAS_TOTAL_u36m,
+    COALESCE(plocal.PRESTADOR_LOCAL_DIAS_SOLICITADOS_u1m, 0) AS PRESTADOR_LOCAL_DIAS_SOLICITADOS_u1m,
+    COALESCE(plocal.PRESTADOR_LOCAL_DIAS_SOLICITADOS_u6m, 0) AS PRESTADOR_LOCAL_DIAS_SOLICITADOS_u6m,
+    COALESCE(plocal.PRESTADOR_LOCAL_DIAS_SOLICITADOS_u12m, 0) AS PRESTADOR_LOCAL_DIAS_SOLICITADOS_u12m,
+    COALESCE(plocal.PRESTADOR_LOCAL_DIAS_SOLICITADOS_u24m, 0) AS PRESTADOR_LOCAL_DIAS_SOLICITADOS_u24m,
+    COALESCE(plocal.PRESTADOR_LOCAL_DIAS_SOLICITADOS_u36m, 0) AS PRESTADOR_LOCAL_DIAS_SOLICITADOS_u36m,
+    
+    /* ===== METRICAS DE EMPLEADOR desde tabla pre-agregada ===== */
+    DIV0(emp.EMPLEADOR_LM_RECHAZADAS_u1m, emp.EMPLEADOR_LM_TOTAL_u1m) AS EMPLEADOR_TASA_RECHAZO_ISAPRE_u1m,
+    DIV0(emp.EMPLEADOR_LM_RECHAZADAS_u6m, emp.EMPLEADOR_LM_TOTAL_u6m) AS EMPLEADOR_TASA_RECHAZO_ISAPRE_u6m,
+    DIV0(emp.EMPLEADOR_LM_RECHAZADAS_u12m, emp.EMPLEADOR_LM_TOTAL_u12m) AS EMPLEADOR_TASA_RECHAZO_ISAPRE_u12m,
+    DIV0(emp.EMPLEADOR_LM_RECHAZADAS_u36m, emp.EMPLEADOR_LM_TOTAL_u36m) AS EMPLEADOR_TASA_RECHAZO_ISAPRE_u36m,
+    COALESCE(emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u1m, 0) AS EMPLEADOR_DIAS_SOLICITADOS_LM_u1m,
+    COALESCE(emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u6m, 0) AS EMPLEADOR_DIAS_SOLICITADOS_LM_u6m,
+    COALESCE(emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u12m, 0) AS EMPLEADOR_DIAS_SOLICITADOS_LM_u12m,
+    COALESCE(emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u36m, 0) AS EMPLEADOR_DIAS_SOLICITADOS_LM_u36m,
+    COALESCE(emp.EMPLEADOR_RUT_DISTINTOS_LM_u36m, 0) AS EMPLEADOR_RUT_DISTINTOS_LM_u36m,
+    DIV0(emp.EMPLEADOR_DIAS_REDUCIDOS_u1m, emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u1m) AS EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_u1m,
+    DIV0(emp.EMPLEADOR_DIAS_REDUCIDOS_u6m, emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u6m) AS EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_u6m,
+    DIV0(emp.EMPLEADOR_DIAS_REDUCIDOS_u12m, emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u12m) AS EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_u12m,
+    DIV0(emp.EMPLEADOR_DIAS_REDUCIDOS_u36m, emp.EMPLEADOR_DIAS_SOLICITADOS_LM_u36m) AS EMPLEADOR_TASA_MODIFICACION_DIAS_ISAPRE_u36m,
+    
+    /* ===== VARIABLES FINALES CALCULADAS ===== */
+    CASE WHEN m.I_DIASAUTORIZADOS = 0 THEN 1 WHEN m.DIASSOLICITADO > m.I_DIASAUTORIZADOS AND m.I_DIASAUTORIZADOS > 0 THEN 0 ELSE NULL END AS ISAP_RECHAZA,
+    CAST(IFF(m.I_DIASAUTORIZADOS = m.DIASSOLICITADO, 1, 0) AS INTEGER) AS ISAP_APRUEBA,
+    CAST(IFF(m.DIASSOLICITADO > m.I_DIASAUTORIZADOS AND m.I_DIASAUTORIZADOS > 0, (m.DIASSOLICITADO - m.I_DIASAUTORIZADOS) / NULLIF(m.DIASSOLICITADO, 0), NULL) AS FLOAT) AS ISAP_MODIFICA_PCT,
+    CAST(NULL AS NUMERIC(1,0)) AS ISAP_PIDE_PE,
+    CASE WHEN UPPER(m.RESOLUCION_COMPIN) = 'RATIFICA' THEN 1 WHEN UPPER(m.RESOLUCION_COMPIN) = 'DENIEGA' THEN 0 ELSE NULL END AS ISAP_GANA_COMPIN,
+    
+    /* ===== MÉTRICAS 15 DÍAS - Calculadas dinámicamente ===== */
+    COALESCE(m15d.CANT_LIC_U15D, 0) AS CANT_LIC_U15D,
+    COALESCE(m15d.CANT_LIC_CON_RESOLUCION_U15D, 0) AS CANT_LIC_CON_RESOLUCION_U15D,
+    COALESCE(m15d.COMPIN_RATIFICA_U15D, 0) AS COMPIN_RATIFICA_U15D,
+    COALESCE(m15d.COMPIN_DENIEGA_U15D, 0) AS COMPIN_DENIEGA_U15D,
+    COALESCE(m15d.F_DIAS_PROMEDIO_U15D, 0) AS F_DIAS_PROMEDIO_U15D,
+    COALESCE(m15d.TOTAL_DIAS_SOLICITADOS_U15D, 0) AS TOTAL_DIAS_SOLICITADOS_U15D,
+    COALESCE(m15d.MAX_DIAS_SOLICITADOS_U15D, 0) AS MAX_DIAS_SOLICITADOS_U15D,
+    COALESCE(m15d.FLAG_MULTIPLES_LIC_U15D, 0) AS FLAG_MULTIPLES_LIC_U15D,
+    m15d.RATIO_APROBACION_U15D,
+    
+    COALESCE(mh15d.HV_N_PRESTACIONES_U15D, 0) AS HV_N_PRESTACIONES_U15D,
+    COALESCE(mh15d.HV_SUM_CANTIDAD_PREST_U15D, 0) AS HV_SUM_CANTIDAD_PREST_U15D,
+    COALESCE(mh15d.HV_N_MEDICOS_U15D, 0) AS HV_N_MEDICOS_U15D,
+    COALESCE(mh15d.HV_FLAG_HOSPITALARIO_U15D, 0) AS HV_FLAG_HOSPITALARIO_U15D,
+    COALESCE(mh15d.HV_FLAG_BONO_U15D, 0) AS HV_FLAG_BONO_U15D,
+    COALESCE(mh15d.HV_FLAG_REEMBOLSO_U15D, 0) AS HV_FLAG_REEMBOLSO_U15D,
+    COALESCE(mh15d.HV_FLAG_GES_U15D, 0) AS HV_FLAG_GES_U15D,
+    COALESCE(mh15d.HV_FLAG_CAEC_U15D, 0) AS HV_FLAG_CAEC_U15D,
+    
+    COALESCE(mp15d.PERITAJES_TOTAL_U15D, 0) AS PERITAJES_TOTAL_U15D,
+    COALESCE(mp15d.PERITAJES_NO_ASISTE_U15D, 0) AS PERITAJES_NO_ASISTE_U15D,
+    COALESCE(mp15d.PERITAJES_DESACUERDO_U15D, 0) AS PERITAJES_DESACUERDO_U15D,
+    COALESCE(mp15d.PERITAJES_ACUERDO_U15D, 0) AS PERITAJES_ACUERDO_U15D,
+    COALESCE(mp15d.DIAS_DESDE_ULTIMO_PERITAJE_U15D, 9999) AS DIAS_DESDE_ULTIMO_PERITAJE_U15D,
+    COALESCE(mp15d.FLAG_PERITAJE_RECIENTE_U15D, 0) AS FLAG_PERITAJE_RECIENTE_U15D,
+    
+    CAST(IFF(m.medico_colmena = 'autvis', 1, 0) AS INTEGER) AS PASO_FASTTRACK
+
+FROM licencias_rango AS m
+
+-- JOIN con métricas de AFILIADO - busca el período más reciente disponible por afiliado
+LEFT JOIN (
+    -- Para cada afiliado, obtener sus métricas del período más reciente
+    SELECT a.* 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.AFILIADO_METRICAS_MENSUALES a
+    INNER JOIN (
+        -- Encontrar el período más reciente para cada afiliado (máximo hasta mes anterior)
+        SELECT 
+            AFILIADO_RUT,
+            MAX(PERIODO) AS MAX_PERIODO
+        FROM OPX.P_DDV_OPX_MDPREDICTIVO.AFILIADO_METRICAS_MENSUALES
+        WHERE PERIODO <= TO_CHAR(DATEADD(MONTH, -1, DATE_TRUNC('MONTH', CURRENT_DATE())), 'MMYYYY')
+        GROUP BY AFILIADO_RUT
+    ) latest ON a.AFILIADO_RUT = latest.AFILIADO_RUT 
+            AND a.PERIODO = latest.MAX_PERIODO
+) AS afi
+    ON m.AFILIADO_RUT = afi.AFILIADO_RUT
+
+-- JOIN con métricas de MEDICO - busca el período más reciente disponible por médico
+LEFT JOIN (
+    SELECT med.* 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.MEDICO_METRICAS_MENSUALES med
+    INNER JOIN (
+        SELECT 
+            PRESTADOR_RUT,
+            MAX(PERIODO) AS MAX_PERIODO
+        FROM OPX.P_DDV_OPX_MDPREDICTIVO.MEDICO_METRICAS_MENSUALES
+        WHERE PERIODO <= TO_CHAR(DATEADD(MONTH, -1, DATE_TRUNC('MONTH', CURRENT_DATE())), 'MMYYYY')
+        GROUP BY PRESTADOR_RUT
+    ) latest ON med.PRESTADOR_RUT = latest.PRESTADOR_RUT 
+            AND med.PERIODO = latest.MAX_PERIODO
+) AS med
+    ON m.PRESTADOR_RUT = med.PRESTADOR_RUT
+
+-- JOIN con métricas de PRESTADOR_LOCAL - busca el período más reciente disponible
+LEFT JOIN (
+    SELECT pl.* 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.PRESTADOR_LOCAL_METRICAS_MENSUALES pl
+    INNER JOIN (
+        SELECT 
+            PRESTADOR_LOCAL_RUT,
+            MAX(PERIODO) AS MAX_PERIODO
+        FROM OPX.P_DDV_OPX_MDPREDICTIVO.PRESTADOR_LOCAL_METRICAS_MENSUALES
+        WHERE PERIODO <= TO_CHAR(DATEADD(MONTH, -1, DATE_TRUNC('MONTH', CURRENT_DATE())), 'MMYYYY')
+        GROUP BY PRESTADOR_LOCAL_RUT
+    ) latest ON pl.PRESTADOR_LOCAL_RUT = latest.PRESTADOR_LOCAL_RUT 
+            AND pl.PERIODO = latest.MAX_PERIODO
+) AS plocal
+    ON m.PRESTADOR_LOCAL_RUT = plocal.PRESTADOR_LOCAL_RUT
+
+-- JOIN con métricas de EMPLEADOR - busca el período más reciente disponible
+LEFT JOIN (
+    SELECT emp.* 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.EMPLEADOR_METRICAS_MENSUALES emp
+    INNER JOIN (
+        SELECT 
+            EMPLEADOR_RUT,
+            MAX(PERIODO) AS MAX_PERIODO
+        FROM OPX.P_DDV_OPX_MDPREDICTIVO.EMPLEADOR_METRICAS_MENSUALES
+        WHERE PERIODO <= TO_CHAR(DATEADD(MONTH, -1, DATE_TRUNC('MONTH', CURRENT_DATE())), 'MMYYYY')
+        GROUP BY EMPLEADOR_RUT
+    ) latest ON emp.EMPLEADOR_RUT = latest.EMPLEADOR_RUT 
+            AND emp.PERIODO = latest.MAX_PERIODO
+) AS emp
+    ON m.EMPLEADOR_RUT = emp.EMPLEADOR_RUT
+
+-- JOIN con métricas de 15 días
+LEFT JOIN metricas_15d m15d
+    ON m.AFILIADO_RUT = m15d.AFILIADO_RUT
+    AND m.LCC_COMCOR = m15d.LCC_COMCOR
+    AND m.LCC_COMCOD = m15d.LCC_COMCOD
+
+LEFT JOIN metricas_hv_15d mh15d
+    ON m.AFILIADO_RUT = mh15d.AFILIADO_RUT
+    AND m.LCC_COMCOR = mh15d.LCC_COMCOR
+    AND m.LCC_COMCOD = mh15d.LCC_COMCOD
+
+LEFT JOIN metricas_peritajes_15d mp15d
+    ON m.AFILIADO_RUT = mp15d.AFILIADO_RUT
+    AND m.LCC_COMCOR = mp15d.LCC_COMCOR
+    AND m.LCC_COMCOD = mp15d.LCC_COMCOD
+
+-- Evitar duplicados - no insertar si ya existe
+WHERE NOT EXISTS (
+    SELECT 1 
+    FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_OPTIMIZADO opt
+    WHERE opt.LCC_COMCOR = m.LCC_COMCOR
+      AND opt.LCC_COMCOD = m.LCC_COMCOD
+);

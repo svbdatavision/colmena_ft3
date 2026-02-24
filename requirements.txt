@@ -1,0 +1,35 @@
+# Core dependencies
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+lightgbm>=4.0.0
+snowflake-connector-python[pandas]>=3.0.0
+pyarrow>=14.0.0
+python-dotenv>=1.0.0
+optuna==3.5.0
+openpyxl>=3.0.0
+
+# Statistical analysis and auditing
+scipy>=1.11.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Model interpretation
+shap>=0.42.0
+
+# Utilities
+joblib>=1.3.0
+tqdm>=4.65.0
+pyyaml>=6.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=23.3.0
+flake8>=6.0.0
+mypy>=1.3.0

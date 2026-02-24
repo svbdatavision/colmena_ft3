@@ -1,0 +1,72 @@
+services:
+  # Servicio con cron para ejecución programada
+  ft3-scheduler:
+    build: 
+      context: ..
+      dockerfile: python_model/docker/Dockerfile
+    container_name: ft3-scheduler
+    environment:
+      - SF_USER=${SF_USER}
+      - SF_PASSWORD=${SF_PASSWORD}
+      - SF_ACCOUNT=${SF_ACCOUNT:-COLMENA-ISAPRE_COLMENA}
+      - SF_WAREHOUSE=${SF_WAREHOUSE:-P_ML}
+      - SF_DATABASE=${SF_DATABASE:-OPX}
+      - SF_SCHEMA=${SF_SCHEMA:-P_DDV_OPX_MDPREDICTIVO}
+      - SF_ROLE=${SF_ROLE:-EX_ML}
+      - TZ=America/Santiago
+    volumes:
+      - ./models:/app/models
+      - ./results:/app/results
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./.env:/app/.env
+    restart: unless-stopped
+    networks:
+      - ft3-network
+
+  # Servicio para reentrenamiento trimestral
+  ft3-training:
+    build: .
+    container_name: ft3-training
+    environment:
+      - SF_USER=${SF_USER}
+      - SF_PASSWORD=${SF_PASSWORD}
+      - SF_ACCOUNT=${SF_ACCOUNT:-COLMENA-ISAPRE_COLMENA}
+      - SF_WAREHOUSE=${SF_WAREHOUSE:-P_ML}
+      - SF_DATABASE=${SF_DATABASE:-OPX}
+      - SF_SCHEMA=${SF_SCHEMA:-P_DDV_OPX_MDPREDICTIVO}
+      - SF_ROLE=${SF_ROLE:-EX_ML}
+      - TZ=America/Santiago
+    volumes:
+      - ./models:/app/models
+      - ./results:/app/results
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./data:/app/data
+    command: ["python", "main.py", "--mode", "train"]
+    profiles: ["training"]
+    networks:
+      - ft3-network
+
+  # Servicio para monitoreo y logs
+  ft3-monitor:
+    image: grafana/promtail:latest
+    container_name: ft3-monitor
+    volumes:
+      - ./logs:/var/log
+      - ./config/promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    profiles: ["monitoring"]
+    networks:
+      - ft3-network
+
+networks:
+  ft3-network:
+    driver: bridge
+
+volumes:
+  models:
+  results:
+  reports:
+  logs:
