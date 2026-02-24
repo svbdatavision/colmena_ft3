@@ -880,7 +880,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
 
             tabla_temp = f"{tabla_diaria}_TEMP"
             cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp}")
-            cursor.execute(f"CREATE TEMPORARY TABLE {tabla_temp} LIKE {tabla_diaria}")
+            cursor.execute(f"CREATE TABLE {tabla_temp} LIKE {tabla_diaria}")
             print(f"      ✓ Tabla temporal {tabla_temp} creada")
 
             df_daily['GLOSA_GENERADA'] = ''
@@ -1260,7 +1260,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             # Crear tabla temporal para MERGE de pendientes
             tabla_temp_pend = f"{tabla_pendientes}_TEMP"
             cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp_pend}")
-            cursor.execute(f"CREATE TEMPORARY TABLE {tabla_temp_pend} LIKE {tabla_pendientes}")
+            cursor.execute(f"CREATE TABLE {tabla_temp_pend} LIKE {tabla_pendientes}")
             
             if len(df_snowflake_pendientes) > 0:
                 print(f"   - Procesando {len(df_snowflake_pendientes):,} licencias pendientes...")
