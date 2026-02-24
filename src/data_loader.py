@@ -1,12 +1,13 @@
 """
-Data loader module for connecting to Snowflake and loading data
+Data loader module for connecting to Databricks SQL and loading data.
+
+`SnowflakeDataLoader` is kept as a backwards-compatible alias.
 """
 import os
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
-import snowflake.connector
-from snowflake.connector.pandas_tools import pd_writer
+import databricks.sql as databricks_sql
 from dotenv import load_dotenv
 import yaml
 
@@ -18,90 +19,127 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class SnowflakeDataLoader:
-    """Class to handle Snowflake connections and data loading"""
+class DatabricksDataLoader:
+    """Class to handle Databricks SQL connections and data loading"""
     
     def __init__(self, config_path: str = "config.yaml"):
-        """Initialize Snowflake connection with configuration"""
+        """Initialize Databricks SQL connection with configuration."""
         with open(config_path, 'r') as file:
             self.config = yaml.safe_load(file)
-        
-        # --- Configuración ---
-        SF_USER = os.environ.get('SF_USER', 'AVERGARA')
-        SF_PASSWORD = os.environ.get('SF_PASSWORD', 'Padrekenten1ch')
-        if not SF_PASSWORD:
-            raise ValueError("Por favor configure la variable de entorno SF_PASSWORD")
-        SF_ACCOUNT = os.environ.get('SF_ACCOUNT', 'COLMENA-ISAPRE_COLMENA')
-        SF_WAREHOUSE = os.environ.get('SF_WAREHOUSE', 'P_ML')
-        SF_DATABASE = os.environ.get('SF_DATABASE', 'OPX')
-        SF_SCHEMA = os.environ.get('SF_SCHEMA', 'P_DDV_OPX_MDPREDICTIVO')
-        SF_ROLE = os.environ.get('SF_ROLE', 'EX_ML')
-        
+
+        server_hostname = os.environ.get("DATABRICKS_SERVER_HOSTNAME", "").strip()
+        http_path = os.environ.get("DATABRICKS_HTTP_PATH", "").strip()
+        access_token = (
+            os.environ.get("DATABRICKS_ACCESS_TOKEN")
+            or os.environ.get("DATABRICKS_TOKEN")
+            or ""
+        ).strip()
+        catalog = os.environ.get("DATABRICKS_CATALOG", "").strip()
+        schema = os.environ.get("DATABRICKS_SCHEMA", "").strip()
+
         self.connection_params = {
-            'user': SF_USER,
-            'password': SF_PASSWORD,
-            'account': SF_ACCOUNT,
-            'warehouse': SF_WAREHOUSE,
-            'database': SF_DATABASE,
-            'schema': SF_SCHEMA,
-            'role': SF_ROLE,
-            'client_session_keep_alive': True
+            "server_hostname": server_hostname,
+            "http_path": http_path,
+            "access_token": access_token,
+            "catalog": catalog,
+            # Keep database alias for legacy callsites.
+            "database": catalog,
+            "schema": schema,
         }
-        
+
         self.conn = None
         self.cursor = None
-        
+
     def connect(self):
-        """Establish connection to Snowflake"""
+        """Establish connection to Databricks SQL."""
+        required = {
+            "DATABRICKS_SERVER_HOSTNAME": self.connection_params["server_hostname"],
+            "DATABRICKS_HTTP_PATH": self.connection_params["http_path"],
+            "DATABRICKS_ACCESS_TOKEN/DATABRICKS_TOKEN": self.connection_params["access_token"],
+        }
+        missing = [key for key, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"Por favor configure las variables de entorno: {', '.join(missing)}")
+
+        conn_kwargs: Dict[str, Any] = {
+            "server_hostname": self.connection_params["server_hostname"],
+            "http_path": self.connection_params["http_path"],
+            "access_token": self.connection_params["access_token"],
+            "_user_agent_entry": "FT3",
+        }
+        if self.connection_params["catalog"]:
+            conn_kwargs["catalog"] = self.connection_params["catalog"]
+        if self.connection_params["schema"]:
+            conn_kwargs["schema"] = self.connection_params["schema"]
+
         try:
-            self.conn = snowflake.connector.connect(**self.connection_params)
+            self.conn = databricks_sql.connect(**conn_kwargs)
             self.cursor = self.conn.cursor()
-            logger.info("Successfully connected to Snowflake")
+            logger.info("Successfully connected to Databricks SQL")
         except Exception as e:
-            logger.error(f"Failed to connect to Snowflake: {str(e)}")
+            logger.error(f"Failed to connect to Databricks SQL: {str(e)}")
             raise
-    
+
     def disconnect(self):
-        """Close Snowflake connection"""
+        """Close Databricks SQL connection."""
         if self.cursor:
             self.cursor.close()
         if self.conn:
             self.conn.close()
-        logger.info("Disconnected from Snowflake")
-    
+        logger.info("Disconnected from Databricks SQL")
+
     def execute_query(self, query: str, chunk_size: int = 500000) -> pd.DataFrame:
-        """Execute a query and return results as DataFrame
-        
+        """Execute a query and return results as DataFrame.
+
         Args:
             query: SQL query to execute
             chunk_size: Number of rows to fetch at a time (default 500k)
-        
+
         Returns:
             DataFrame with query results
         """
+        if self.conn is None:
+            raise RuntimeError("No hay conexión activa. Ejecute connect() primero.")
+
+        cursor = None
         try:
-            # For large datasets, read in chunks
-            chunks = []
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+
+            columns = [desc[0] for desc in (cursor.description or [])]
+            if not columns:
+                logger.info("Query executed successfully, returned no resultset")
+                return pd.DataFrame()
+
+            chunks: List[pd.DataFrame] = []
             total_rows = 0
-            
-            # Use pandas read_sql with chunksize parameter
-            for chunk in pd.read_sql(query, self.conn, chunksize=chunk_size):
-                chunks.append(chunk)
-                total_rows += len(chunk)
-                logger.info(f"Loaded chunk: {len(chunk)} rows (total so far: {total_rows})")
-            
-            # Combine all chunks
+
+            while True:
+                rows = cursor.fetchmany(chunk_size)
+                if not rows:
+                    break
+                chunk_df = pd.DataFrame(rows, columns=columns)
+                chunks.append(chunk_df)
+                total_rows += len(chunk_df)
+                logger.info(f"Loaded chunk: {len(chunk_df)} rows (total so far: {total_rows})")
+
             if chunks:
                 df = pd.concat(chunks, ignore_index=True)
                 logger.info(f"Query executed successfully, returned {len(df)} rows")
                 return df
-            else:
-                logger.info("Query returned no rows")
-                return pd.DataFrame()
-                
+
+            logger.info("Query returned no rows")
+            return pd.DataFrame(columns=columns)
+
         except Exception as e:
             logger.error(f"Query execution failed: {str(e)}")
             raise
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
     
     def load_training_data(self, 
                           table_name: str = "MODELO_LM_202507_TRAIN",
@@ -320,19 +358,54 @@ class SnowflakeDataLoader:
     def save_predictions(self, 
                         predictions_df: pd.DataFrame,
                         table_name: str = "MODEL_PREDICTIONS"):
-        """Save predictions back to Snowflake"""
+        """Save predictions back to Databricks SQL."""
+        if self.conn is None:
+            raise RuntimeError("No hay conexión activa. Ejecute connect() primero.")
+        if predictions_df.empty:
+            logger.info("No predictions to save")
+            return
+
         try:
-            predictions_df.to_sql(
-                table_name,
-                self.conn,
-                if_exists='append',
-                index=False,
-                method=pd_writer
-            )
+            columns = list(predictions_df.columns)
+            placeholders = ", ".join(["?"] * len(columns))
+            insert_sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
+
+            records: List[Tuple[Any, ...]] = []
+            for row in predictions_df.itertuples(index=False, name=None):
+                normalized = []
+                for value in row:
+                    if pd.isna(value):
+                        normalized.append(None)
+                    elif isinstance(value, pd.Timestamp):
+                        normalized.append(value.to_pydatetime())
+                    elif hasattr(value, "item"):
+                        normalized.append(value.item())
+                    else:
+                        normalized.append(value)
+                records.append(tuple(normalized))
+
+            cursor = self.conn.cursor()
+            try:
+                batch_size = 1000
+                for idx in range(0, len(records), batch_size):
+                    batch = records[idx:idx + batch_size]
+                    cursor.executemany(insert_sql, batch)
+                try:
+                    self.conn.commit()
+                except Exception:
+                    # Some DB-API drivers autocommit; keep compatibility.
+                    pass
+            finally:
+                cursor.close()
+
             logger.info(f"Saved {len(predictions_df)} predictions to {table_name}")
         except Exception as e:
             logger.error(f"Failed to save predictions: {str(e)}")
             raise
+
+
+# Backwards compatibility: keep historical class name used across the codebase.
+SnowflakeDataLoader = DatabricksDataLoader
 
 
 def load_data_for_training(config_path: str = "config.yaml",
@@ -359,7 +432,7 @@ def load_data_for_training(config_path: str = "config.yaml",
         # Establish connection
         loader.connect()
         
-        # Load data from Snowflake
+        # Load data from Databricks SQL
         df = loader.load_training_data(
             table_name="MODELO_LM_202507_TRAIN",  # Correct table name
             date_from=date_from,
@@ -390,7 +463,7 @@ if __name__ == "__main__":
     
     # Check if .env exists
     if not os.path.exists('../.env'):
-        print("Please create a .env file with your Snowflake credentials")
+        print("Please create a .env file with your Databricks credentials")
         print("Copy .env.example to .env and fill in your credentials")
         exit(1)
     

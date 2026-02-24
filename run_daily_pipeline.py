@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the FastTrack 3.0 daily pipeline using a single Snowflake session."""
+"""Run the FastTrack 3.0 daily pipeline using a single Databricks session."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import snowflake.connector
+import databricks.sql as databricks_sql
 from dotenv import load_dotenv
 
 from FT3_dia import apply_model_to_all_licenses
@@ -27,38 +27,117 @@ def _load_environment() -> None:
         load_dotenv()
 
 
-def _build_conn() -> snowflake.connector.SnowflakeConnection:
-    """Create a Snowflake connection with keep-alive enabled."""
+def _build_conn():
+    """Create a Databricks SQL connection."""
     required = [
-        "SF_USER",
-        "SF_PASSWORD",
-        "SF_ACCOUNT",
-        "SF_WAREHOUSE",
-        "SF_DATABASE",
-        "SF_SCHEMA",
+        "DATABRICKS_SERVER_HOSTNAME",
+        "DATABRICKS_HTTP_PATH",
     ]
     missing = [var for var in required if not os.getenv(var)]
+    if not (os.getenv("DATABRICKS_ACCESS_TOKEN") or os.getenv("DATABRICKS_TOKEN")):
+        missing.append("DATABRICKS_ACCESS_TOKEN/DATABRICKS_TOKEN")
     if missing:
         raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
 
-    return snowflake.connector.connect(
-        user=os.getenv("SF_USER"),
-        password=os.getenv("SF_PASSWORD"),
-        account=os.getenv("SF_ACCOUNT"),
-        warehouse=os.getenv("SF_WAREHOUSE"),
-        database=os.getenv("SF_DATABASE"),
-        schema=os.getenv("SF_SCHEMA"),
-        role=os.getenv("SF_ROLE"),
-        client_session_keep_alive=True,
-        application="FT3_DAILY_PIPELINE",
-    )
+    conn_kwargs = {
+        "server_hostname": os.getenv("DATABRICKS_SERVER_HOSTNAME"),
+        "http_path": os.getenv("DATABRICKS_HTTP_PATH"),
+        "access_token": os.getenv("DATABRICKS_ACCESS_TOKEN") or os.getenv("DATABRICKS_TOKEN"),
+        "_user_agent_entry": "FT3_DAILY_PIPELINE",
+    }
+    if os.getenv("DATABRICKS_CATALOG"):
+        conn_kwargs["catalog"] = os.getenv("DATABRICKS_CATALOG")
+    if os.getenv("DATABRICKS_SCHEMA"):
+        conn_kwargs["schema"] = os.getenv("DATABRICKS_SCHEMA")
+    return databricks_sql.connect(**conn_kwargs)
 
 
-def _execute_sql(conn: snowflake.connector.SnowflakeConnection,
+def _split_sql_statements(query_content: str) -> list[str]:
+    """Split SQL script into executable statements."""
+    statements = []
+    buffer = []
+    in_single_quote = False
+    in_double_quote = False
+    in_backtick = False
+    in_line_comment = False
+    in_block_comment = False
+    i = 0
+    n = len(query_content)
+
+    while i < n:
+        ch = query_content[i]
+        nxt = query_content[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                buffer.append(ch)
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if not in_single_quote and not in_double_quote and not in_backtick:
+            if ch == "-" and nxt == "-":
+                in_line_comment = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+
+        if ch == "'" and not in_double_quote and not in_backtick:
+            if in_single_quote and nxt == "'":
+                buffer.append(ch)
+                buffer.append(nxt)
+                i += 2
+                continue
+            in_single_quote = not in_single_quote
+            buffer.append(ch)
+            i += 1
+            continue
+
+        if ch == '"' and not in_single_quote and not in_backtick:
+            in_double_quote = not in_double_quote
+            buffer.append(ch)
+            i += 1
+            continue
+
+        if ch == "`" and not in_single_quote and not in_double_quote:
+            in_backtick = not in_backtick
+            buffer.append(ch)
+            i += 1
+            continue
+
+        if ch == ";" and not in_single_quote and not in_double_quote and not in_backtick:
+            statement = "".join(buffer).strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+            i += 1
+            continue
+
+        buffer.append(ch)
+        i += 1
+
+    trailing = "".join(buffer).strip()
+    if trailing:
+        statements.append(trailing)
+
+    return statements
+
+
+def _execute_sql(conn,
                  sql_path: Path,
                  label: str,
                  summary: str) -> None:
-    """Execute a SQL file inside the shared Snowflake session."""
+    """Execute a SQL file inside the shared Databricks session."""
     print(f"\nPASO {label}: Ejecutando {sql_path.name}...")
     print("----------------------------------------")
 
@@ -68,18 +147,29 @@ def _execute_sql(conn: snowflake.connector.SnowflakeConnection,
     with sql_path.open("r", encoding="utf-8") as handle:
         query_content = handle.read()
 
+    statements = _split_sql_statements(query_content)
+    if not statements:
+        print(f"⚠️  {sql_path.name} no contiene sentencias ejecutables")
+        return
+
     cursor = conn.cursor()
     start_time = datetime.now()
     try:
-        cursor.execute("USE DATABASE OPX")
-        cursor.execute("USE SCHEMA P_DDV_OPX_MDPREDICTIVO")
-        cursor.execute(query_content, num_statements=0)
-        conn.commit()
+        for statement in statements:
+            cursor.execute(statement)
+        try:
+            conn.commit()
+        except Exception:
+            # Some DB-API connectors autocommit.
+            pass
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"✅ {sql_path.name} ejecutada en {elapsed:.1f} segundos")
+        print(f"✅ {sql_path.name} ejecutada en {elapsed:.1f} segundos ({len(statements)} sentencias)")
         print(f"   {summary}")
     except Exception as exc:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         print(f"❌ Error en {sql_path.name}: {exc}")
         raise
     finally:
@@ -97,11 +187,15 @@ def main() -> int:
     try:
         conn = _build_conn()
     except Exception as exc:
-        print(f"❌ No fue posible conectar a Snowflake: {exc}")
+        print(f"❌ No fue posible conectar a Databricks SQL: {exc}")
         return 1
 
     loader = SnowflakeDataLoader()
     loader.conn = conn
+    try:
+        loader.cursor = conn.cursor()
+    except Exception:
+        loader.cursor = None
 
     step_summaries = []
 

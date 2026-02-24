@@ -1,12 +1,11 @@
 """
-Data loader module v2 - Corregido para manejar correctamente el flujo COMPIN
+Data loader module v2 - Corregido para manejar correctamente el flujo COMPIN.
 """
 import os
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
-import snowflake.connector
-from snowflake.connector.pandas_tools import pd_writer
+import databricks.sql as databricks_sql
 from dotenv import load_dotenv
 import yaml
 
@@ -19,53 +18,96 @@ logger = logging.getLogger(__name__)
 
 
 class SnowflakeDataLoader:
-    """Class to handle Snowflake connections and data loading"""
+    """Backwards-compatible loader class using Databricks SQL."""
     
     def __init__(self, config_path: str = "config.yaml"):
-        """Initialize Snowflake connection with configuration"""
+        """Initialize Databricks SQL connection with configuration."""
         with open(config_path, 'r') as file:
             self.config = yaml.safe_load(file)
-        
+
+        server_hostname = os.environ.get("DATABRICKS_SERVER_HOSTNAME", "").strip()
+        http_path = os.environ.get("DATABRICKS_HTTP_PATH", "").strip()
+        access_token = (
+            os.environ.get("DATABRICKS_ACCESS_TOKEN")
+            or os.environ.get("DATABRICKS_TOKEN")
+            or ""
+        ).strip()
+        catalog = os.environ.get("DATABRICKS_CATALOG", "").strip()
+        schema = os.environ.get("DATABRICKS_SCHEMA", "").strip()
+
         self.connection_params = {
-            'user': os.getenv('SF_USER'),
-            'password': os.getenv('SF_PASSWORD'),
-            'account': os.getenv('SF_ACCOUNT'),
-            'warehouse': self.config['data']['snowflake']['warehouse'],
-            'database': self.config['data']['snowflake']['database'],
-            'schema': self.config['data']['snowflake']['schema'],
-            'role': self.config['data']['snowflake']['role']
+            "server_hostname": server_hostname,
+            "http_path": http_path,
+            "access_token": access_token,
+            "catalog": catalog,
+            # Keep database alias for legacy callsites.
+            "database": catalog,
+            "schema": schema,
         }
         
         self.conn = None
         self.cursor = None
         
     def connect(self):
-        """Establish connection to Snowflake"""
+        """Establish connection to Databricks SQL."""
+        required = {
+            "DATABRICKS_SERVER_HOSTNAME": self.connection_params["server_hostname"],
+            "DATABRICKS_HTTP_PATH": self.connection_params["http_path"],
+            "DATABRICKS_ACCESS_TOKEN/DATABRICKS_TOKEN": self.connection_params["access_token"],
+        }
+        missing = [key for key, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"Por favor configure las variables de entorno: {', '.join(missing)}")
+
+        conn_kwargs: Dict[str, Any] = {
+            "server_hostname": self.connection_params["server_hostname"],
+            "http_path": self.connection_params["http_path"],
+            "access_token": self.connection_params["access_token"],
+            "_user_agent_entry": "FT3",
+        }
+        if self.connection_params["catalog"]:
+            conn_kwargs["catalog"] = self.connection_params["catalog"]
+        if self.connection_params["schema"]:
+            conn_kwargs["schema"] = self.connection_params["schema"]
+
         try:
-            self.conn = snowflake.connector.connect(**self.connection_params)
+            self.conn = databricks_sql.connect(**conn_kwargs)
             self.cursor = self.conn.cursor()
-            logger.info("Successfully connected to Snowflake")
+            logger.info("Successfully connected to Databricks SQL")
         except Exception as e:
-            logger.error(f"Failed to connect to Snowflake: {str(e)}")
+            logger.error(f"Failed to connect to Databricks SQL: {str(e)}")
             raise
     
     def disconnect(self):
-        """Close Snowflake connection"""
+        """Close Databricks SQL connection."""
         if self.cursor:
             self.cursor.close()
         if self.conn:
             self.conn.close()
-        logger.info("Disconnected from Snowflake")
+        logger.info("Disconnected from Databricks SQL")
     
     def execute_query(self, query: str) -> pd.DataFrame:
         """Execute a query and return results as DataFrame"""
+        if self.conn is None:
+            raise RuntimeError("No hay conexión activa. Ejecute connect() primero.")
+        cursor = None
         try:
-            df = pd.read_sql(query, self.conn)
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+            columns = [desc[0] for desc in (cursor.description or [])]
+            rows = cursor.fetchall()
+            df = pd.DataFrame(rows, columns=columns)
             logger.info(f"Query executed successfully, returned {len(df)} rows")
             return df
         except Exception as e:
             logger.error(f"Query execution failed: {str(e)}")
             raise
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
     
     def load_training_data(self, 
                           table_name: str = "MODELO_LM_202507_TRAIN",
@@ -74,7 +116,7 @@ class SnowflakeDataLoader:
                           limit: Optional[int] = None,
                           analysis_mode: str = "compin") -> pd.DataFrame:
         """
-        Load training data from Snowflake
+        Load training data from Databricks SQL
         
         Args:
             table_name: Name of the table to load from
@@ -259,7 +301,7 @@ def load_data_for_training(config_path: str = "config.yaml",
         logger.info(f"- COMPIN Ratified: {stats['compin_ratified']:,} ({stats.get('pct_ratified', 0):.1f}%)")
         logger.info(f"- COMPIN Denied: {stats['compin_denied']:,} ({stats.get('pct_denied', 0):.1f}%)")
         
-        # Load data from Snowflake
+        # Load data from Databricks SQL
         df = loader.load_training_data(
             table_name="MODELO_LM_202507_TRAIN",
             date_from=date_from,
@@ -290,7 +332,7 @@ if __name__ == "__main__":
     
     # Check if .env exists
     if not os.path.exists('../.env'):
-        print("Please create a .env file with your Snowflake credentials")
+        print("Please create a .env file with your Databricks credentials")
         print("Copy .env.example to .env and fill in your credentials")
         exit(1)
     
