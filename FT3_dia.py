@@ -10,13 +10,13 @@ FLUJO DE DATOS:
    - Sin parámetros: Solo licencias sin dictamen (TARGET_APRUEBA IS NULL)
    - Con fechas: Todas las licencias del período especificado
 3. Modelo: Aplica FastTrack 3.0 para predicciones
-4. Output: Resultados en Snowflake (FT30_PREDICCIONES_DIARIAS y FT30_LICENCIAS_PENDIENTES)
+4. Output: Resultados en Databricks SQL (FT30_PREDICCIONES_DIARIAS y FT30_LICENCIAS_PENDIENTES)
 
 ACTUALIZACIÓN 2025-09-05:
 - SIEMPRE usa MODELO_LM_202507_TRAIN (no MODELO_LM_DIARIO_TRAIN)
 - Sin parámetros: procesa solo licencias pendientes (sin dictamen)
 - Con parámetros de fecha: procesa todas las licencias del período
-- Solo guarda resultados en Snowflake, no genera Excel por defecto
+- Solo guarda resultados en Databricks SQL, no genera Excel por defecto
 """
 import pandas as pd
 import numpy as np
@@ -30,6 +30,58 @@ from src.data_loader import SnowflakeDataLoader
 from src.feature_engineering import FeatureEngineer
 from src.model_training import LightGBMTrainer
 import joblib
+
+
+def _write_dataframe_to_table(conn, df, table_name, batch_size=1000, **_kwargs):
+    """
+    Reemplazo compatible de write_pandas usando executemany sobre DB-API.
+    """
+    if df is None or len(df) == 0:
+        return True, 0, 0, None
+
+    columns = [str(col).strip() for col in df.columns]
+    placeholders = ", ".join(["?"] * len(columns))
+    insert_sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
+
+    cursor = conn.cursor()
+    nchunks = 0
+    nrows = 0
+    try:
+        for start in range(0, len(df), batch_size):
+            batch_df = df.iloc[start:start + batch_size]
+            records = []
+            for row in batch_df.itertuples(index=False, name=None):
+                normalized = []
+                for value in row:
+                    if pd.isna(value):
+                        normalized.append(None)
+                    elif isinstance(value, pd.Timestamp):
+                        normalized.append(value.to_pydatetime())
+                    elif isinstance(value, np.generic):
+                        normalized.append(value.item())
+                    else:
+                        normalized.append(value)
+                records.append(tuple(normalized))
+
+            if records:
+                cursor.executemany(insert_sql, records)
+                nchunks += 1
+                nrows += len(records)
+
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        return True, nchunks, nrows, None
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cursor.close()
+
 
 def align_features_with_model(X, model_path="models/fasttrack_model.pkl"):
     """
@@ -285,7 +337,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             AND TRIM(CIE_GRUPO) != ''
             """
         
-        df_todas = pd.read_sql(query_todas, loader.conn)
+        df_todas = loader.execute_query(query_todas)
         print(f"   Total licencias cargadas: {len(df_todas):,}")
         
         # Separar en con dictamen y pendientes basado en TARGET_APRUEBA
@@ -669,8 +721,8 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                 pct = count / len(verde_pendientes) * 100
                 print(f"  {i:2d}. {cie}: {count:,} ({pct:.1f}%)")
         
-        # 7. GUARDAR RESULTADOS EN SNOWFLAKE
-        print("\n\n7. Guardando predicciones en Snowflake...")
+        # 7. GUARDAR RESULTADOS EN DATABRICKS SQL
+        print("\n\n7. Guardando predicciones en Databricks SQL...")
         
         # Generar timestamp para el archivo Excel
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -678,8 +730,6 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         
         # Guardar predicciones diarias (todas: con dictamen y pendientes)
         try:
-            from snowflake.connector.pandas_tools import write_pandas
-            
             # 7.1 GUARDAR PREDICCIONES DIARIAS (TODAS)
             print("   A. Guardando predicciones diarias (todas las licencias)...")
             
@@ -699,7 +749,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                 else:
                     print(f"      ✗ {col} NO existe")
             
-            # Preparar para Snowflake
+            # Preparar para Databricks SQL
             df_daily = all_predictions.copy()
             df_daily['FECHA_PROCESAMIENTO'] = fecha_procesamiento
             df_daily['FECHA_DESDE'] = date_from
@@ -707,7 +757,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             df_daily['MODELO_VERSION'] = 'FT30'
             df_daily['ES_PENDIENTE'] = df_daily['LCC_COMCOR'].isin(info_pendientes['LCC_COMCOR']).astype(int)
             
-            # Convertir campos de fecha a formato string ISO para evitar problemas con Snowflake
+            # Convertir campos de fecha a formato string ISO para evitar problemas de carga
             date_columns = ['FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'EPISODIO_FEC_INI']
             for col in date_columns:
                 if col in df_daily.columns:
@@ -925,7 +975,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     df_daily[col] = pd.Series([None] * len(df_daily), index=df_daily.index)
                     columns_to_save.append(col)
             
-            # Truncar campos de texto para evitar exceeder límites de Snowflake
+            # Truncar campos de texto para evitar exceder límites de columnas
             if 'CIE_GRUPO' in df_daily.columns:
                 df_daily['CIE_GRUPO'] = df_daily['CIE_GRUPO'].astype(str).str[:30]
             if 'CIE_F' in df_daily.columns:
@@ -935,7 +985,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             if 'CAUSAL_GENERADA' in df_daily.columns:
                 df_daily['CAUSAL_GENERADA'] = df_daily['CAUSAL_GENERADA'].astype(str).str[:100]
             
-            # Convertir columnas de fecha a formato string ISO para Snowflake
+            # Convertir columnas de fecha a formato string ISO para carga
             date_columns = ['FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'EPISODIO_FEC_INI', 
                           'FECHA_PROCESAMIENTO', 'FECHA_DESDE', 'FECHA_HASTA']
             for col in date_columns:
@@ -963,7 +1013,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     print(f"      ⚠️ {col} NO está en df_to_save")
             
             # Insertar datos en tabla temporal
-            success, nchunks, nrows, _ = write_pandas(
+            success, nchunks, nrows, _ = _write_dataframe_to_table(
                 conn=loader.conn,
                 df=df_to_save,
                 table_name=tabla_temp,
@@ -1081,7 +1131,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             # 7.2 GUARDAR TAMBIÉN LICENCIAS PENDIENTES EN TABLA SEPARADA (compatibilidad)
             print("\n   B. Guardando licencias pendientes en tabla separada...")
             
-            # Preparar datos para Snowflake - solo licencias pendientes
+            # Preparar datos para Databricks SQL - solo licencias pendientes
             df_snowflake_pendientes = info_pendientes_sorted.copy()
             
             # IMPORTANTE: Asegurar que LCC_COMCOR sea string ANTES de cualquier procesamiento
@@ -1091,7 +1141,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             df_snowflake_pendientes['FECHA_PROCESAMIENTO'] = fecha_procesamiento
             df_snowflake_pendientes['FECHA_PROCESAMIENTO_STR'] = fecha_procesamiento.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Convertir campos de fecha a formato string ISO para Snowflake
+            # Convertir campos de fecha a formato string ISO para carga
             date_columns = ['FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'EPISODIO_FEC_INI', 'FECHA_PROCESAMIENTO']
             for col in date_columns:
                 if col in df_snowflake_pendientes.columns:
@@ -1170,12 +1220,13 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             # Crear tabla temporal para MERGE de pendientes
             tabla_temp_pend = f"{tabla_pendientes}_TEMP"
             cursor.execute(f"DROP TABLE IF EXISTS {tabla_temp_pend}")
+            cursor.execute(f"CREATE TEMPORARY TABLE {tabla_temp_pend} LIKE {tabla_pendientes}")
             
             if len(df_snowflake_pendientes) > 0:
                 print(f"   - Procesando {len(df_snowflake_pendientes):,} licencias pendientes...")
                 
-                # Crear tabla temporal (se creará con write_pandas)
-                success, nchunks, nrows, _ = write_pandas(
+                # Cargar datos en tabla temporal
+                success, nchunks, nrows, _ = _write_dataframe_to_table(
                     conn=loader.conn,
                     df=df_snowflake_pendientes,
                     table_name=tabla_temp_pend,
@@ -1255,7 +1306,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             cursor.close()
             
         except Exception as e:
-            print(f"   ⚠ Advertencia al guardar en Snowflake: {e}")
+            print(f"   ⚠ Advertencia al guardar en Databricks SQL: {e}")
             print("   Continuando con generación de Excel...")
         
         # 8. GENERAR REPORTE EXCEL
@@ -1351,7 +1402,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         print(f"  - Con dictamen: {len(info_con_dictamen):,}")
         print(f"  - Pendientes: {len(info_pendientes):,}")
         print(f"✓ Todas tienen probabilidad y clasificación asignada")
-        print(f"\n✓ SNOWFLAKE: Tablas actualizadas:")
+        print(f"\n✓ DATABRICKS SQL: Tablas actualizadas:")
         print(f"  - FT30_PREDICCIONES_DIARIAS: Todas las predicciones del día")
         print(f"  - FT30_LICENCIAS_PENDIENTES: Solo licencias pendientes")
         
