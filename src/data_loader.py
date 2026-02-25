@@ -7,7 +7,10 @@ import os
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
-import databricks.sql as databricks_sql
+try:
+    import databricks.sql as databricks_sql
+except ModuleNotFoundError:
+    databricks_sql = None
 from dotenv import load_dotenv
 import yaml
 
@@ -52,6 +55,13 @@ class DatabricksDataLoader:
 
     def connect(self):
         """Establish connection to Databricks SQL."""
+        if databricks_sql is None:
+            raise ModuleNotFoundError(
+                "No module named 'databricks.sql'. "
+                "Instale dependencias con: python3 -m pip install -r requirements.txt "
+                "o ejecute: bash scripts/setup_cloud_env.sh"
+            )
+
         required = {
             "DATABRICKS_SERVER_HOSTNAME": self.connection_params["server_hostname"],
             "DATABRICKS_HTTP_PATH": self.connection_params["http_path"],

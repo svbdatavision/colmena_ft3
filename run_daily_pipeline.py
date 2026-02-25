@@ -8,7 +8,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import databricks.sql as databricks_sql
+try:
+    import databricks.sql as databricks_sql
+except ModuleNotFoundError:
+    databricks_sql = None
 from dotenv import load_dotenv
 
 from FT3_dia import apply_model_to_all_licenses
@@ -29,6 +32,13 @@ def _load_environment() -> None:
 
 def _build_conn():
     """Create a Databricks SQL connection."""
+    if databricks_sql is None:
+        raise ModuleNotFoundError(
+            "No module named 'databricks.sql'. "
+            "Instale dependencias con: python3 -m pip install -r requirements.txt "
+            "o ejecute: bash scripts/setup_cloud_env.sh"
+        )
+
     required = [
         "DATABRICKS_SERVER_HOSTNAME",
         "DATABRICKS_HTTP_PATH",
