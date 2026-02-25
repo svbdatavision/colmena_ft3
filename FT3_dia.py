@@ -32,7 +32,7 @@ from src.model_training import LightGBMTrainer
 import joblib
 
 
-def _write_dataframe_to_table(conn, df, table_name, batch_size=1000, **_kwargs):
+def _write_dataframe_to_table(conn, df, table_name, batch_size=200, **_kwargs):
     """
     Reemplazo compatible de write_pandas usando executemany sobre DB-API.
     """
@@ -68,16 +68,8 @@ def _write_dataframe_to_table(conn, df, table_name, batch_size=1000, **_kwargs):
                 nchunks += 1
                 nrows += len(records)
 
-        try:
-            conn.commit()
-        except Exception:
-            pass
         return True, nchunks, nrows, None
     except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         raise
     finally:
         cursor.close()

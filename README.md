@@ -51,7 +51,7 @@ pip install -r requirements.txt
 
 ### Cursor Cloud / Agent Setup
 
-To preinstall the complete FT3 runtime (including Databricks connector and ML stack) on a cloud agent image, run:
+To preinstall the complete FT3 runtime (ML stack + supporting libs) on a cloud agent image, run:
 
 ```bash
 bash scripts/setup_cloud_env.sh

@@ -7,12 +7,9 @@ import os
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
-try:
-    import databricks.sql as databricks_sql
-except ModuleNotFoundError:
-    databricks_sql = None
 from dotenv import load_dotenv
 import yaml
+from src.spark_sql_compat import SparkSQLConnection, get_spark_session
 
 # Load environment variables
 load_dotenv()
@@ -26,77 +23,49 @@ class DatabricksDataLoader:
     """Class to handle Databricks SQL connections and data loading"""
     
     def __init__(self, config_path: str = "config.yaml"):
-        """Initialize Databricks SQL connection with configuration."""
+        """Initialize Spark-based connection-compatible loader."""
         with open(config_path, 'r') as file:
             self.config = yaml.safe_load(file)
 
-        server_hostname = os.environ.get("DATABRICKS_SERVER_HOSTNAME", "").strip()
-        http_path = os.environ.get("DATABRICKS_HTTP_PATH", "").strip()
-        access_token = (
-            os.environ.get("DATABRICKS_ACCESS_TOKEN")
-            or os.environ.get("DATABRICKS_TOKEN")
-            or ""
-        ).strip()
-        catalog = os.environ.get("DATABRICKS_CATALOG", "").strip()
-        schema = os.environ.get("DATABRICKS_SCHEMA", "").strip()
+        snowflake_cfg = self.config.get("data", {}).get("snowflake", {})
+        database = snowflake_cfg.get("database", "")
+        schema = snowflake_cfg.get("schema", "")
 
         self.connection_params = {
-            "server_hostname": server_hostname,
-            "http_path": http_path,
-            "access_token": access_token,
-            "catalog": catalog,
-            # Keep database alias for legacy callsites.
-            "database": catalog,
+            # Keep names for backward compatibility with legacy callsites.
+            "database": database,
             "schema": schema,
         }
 
         self.conn = None
         self.cursor = None
+        self.spark = None
 
     def connect(self):
-        """Establish connection to Databricks SQL."""
-        if databricks_sql is None:
-            raise ModuleNotFoundError(
-                "No module named 'databricks.sql'. "
-                "Instale dependencias con: python3 -m pip install -r requirements.txt "
-                "o ejecute: bash scripts/setup_cloud_env.sh"
-            )
-
-        required = {
-            "DATABRICKS_SERVER_HOSTNAME": self.connection_params["server_hostname"],
-            "DATABRICKS_HTTP_PATH": self.connection_params["http_path"],
-            "DATABRICKS_ACCESS_TOKEN/DATABRICKS_TOKEN": self.connection_params["access_token"],
-        }
-        missing = [key for key, value in required.items() if not value]
-        if missing:
-            raise ValueError(f"Por favor configure las variables de entorno: {', '.join(missing)}")
-
-        conn_kwargs: Dict[str, Any] = {
-            "server_hostname": self.connection_params["server_hostname"],
-            "http_path": self.connection_params["http_path"],
-            "access_token": self.connection_params["access_token"],
-            "_user_agent_entry": "FT3",
-        }
-        if self.connection_params["catalog"]:
-            conn_kwargs["catalog"] = self.connection_params["catalog"]
-        if self.connection_params["schema"]:
-            conn_kwargs["schema"] = self.connection_params["schema"]
-
+        """Bind loader to the active Spark session."""
         try:
-            self.conn = databricks_sql.connect(**conn_kwargs)
+            self.spark = get_spark_session()
+            self.conn = SparkSQLConnection(self.spark)
             self.cursor = self.conn.cursor()
-            logger.info("Successfully connected to Databricks SQL")
+            logger.info("Successfully connected to Spark SQL")
         except Exception as e:
-            logger.error(f"Failed to connect to Databricks SQL: {str(e)}")
+            logger.error(f"Failed to connect to Spark SQL: {str(e)}")
             raise
 
     def disconnect(self):
-        """Close Databricks SQL connection."""
+        """Detach loader from current Spark compatibility connection."""
         if self.cursor:
-            self.cursor.close()
+            try:
+                self.cursor.close()
+            except Exception:
+                pass
         if self.conn:
-            self.conn.close()
-        logger.info("Disconnected from Databricks SQL")
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.spark = None
+        logger.info("Disconnected from Spark SQL")
 
     def execute_query(self, query: str, chunk_size: int = 500000) -> pd.DataFrame:
         """Execute a query and return results as DataFrame.
@@ -108,48 +77,17 @@ class DatabricksDataLoader:
         Returns:
             DataFrame with query results
         """
-        if self.conn is None:
+        if self.spark is None:
             raise RuntimeError("No hay conexión activa. Ejecute connect() primero.")
-
-        cursor = None
         try:
-            cursor = self.conn.cursor()
-            cursor.execute(query)
-
-            columns = [desc[0] for desc in (cursor.description or [])]
-            if not columns:
-                logger.info("Query executed successfully, returned no resultset")
-                return pd.DataFrame()
-
-            chunks: List[pd.DataFrame] = []
-            total_rows = 0
-
-            while True:
-                rows = cursor.fetchmany(chunk_size)
-                if not rows:
-                    break
-                chunk_df = pd.DataFrame(rows, columns=columns)
-                chunks.append(chunk_df)
-                total_rows += len(chunk_df)
-                logger.info(f"Loaded chunk: {len(chunk_df)} rows (total so far: {total_rows})")
-
-            if chunks:
-                df = pd.concat(chunks, ignore_index=True)
-                logger.info(f"Query executed successfully, returned {len(df)} rows")
-                return df
-
-            logger.info("Query returned no rows")
-            return pd.DataFrame(columns=columns)
-
+            # chunk_size kept for API compatibility; Spark handles partitioned execution.
+            del chunk_size
+            df = self.spark.sql(query).toPandas()
+            logger.info(f"Query executed successfully, returned {len(df)} rows")
+            return df
         except Exception as e:
             logger.error(f"Query execution failed: {str(e)}")
             raise
-        finally:
-            if cursor is not None:
-                try:
-                    cursor.close()
-                except Exception:
-                    pass
     
     def load_training_data(self, 
                           table_name: str = "MODELO_LM_202507_TRAIN",
@@ -396,15 +334,10 @@ class DatabricksDataLoader:
 
             cursor = self.conn.cursor()
             try:
-                batch_size = 1000
+                batch_size = 200
                 for idx in range(0, len(records), batch_size):
                     batch = records[idx:idx + batch_size]
                     cursor.executemany(insert_sql, batch)
-                try:
-                    self.conn.commit()
-                except Exception:
-                    # Some DB-API drivers autocommit; keep compatibility.
-                    pass
             finally:
                 cursor.close()
 
@@ -469,14 +402,7 @@ def load_data_for_training(config_path: str = "config.yaml",
 
 if __name__ == "__main__":
     # Test the data loader
-    import os
-    
-    # Check if .env exists
-    if not os.path.exists('../.env'):
-        print("Please create a .env file with your Databricks credentials")
-        print("Copy .env.example to .env and fill in your credentials")
-        exit(1)
-    
+
     try:
         # Test loading a small sample
         df, config = load_data_for_training(limit=1000)

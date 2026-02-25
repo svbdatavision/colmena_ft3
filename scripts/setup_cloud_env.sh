@@ -36,7 +36,6 @@ modules = [
     "lightgbm",
     "optuna",
     "shap",
-    "databricks.sql",
 ]
 
 failures = []

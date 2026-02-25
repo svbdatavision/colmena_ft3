@@ -8,16 +8,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-try:
-    import databricks.sql as databricks_sql
-except ModuleNotFoundError:
-    databricks_sql = None
 from dotenv import load_dotenv
 
 from FT3_dia import apply_model_to_all_licenses
 from src.data_loader import SnowflakeDataLoader
+from src.spark_sql_compat import get_spark_session
 
 BASE_DIR = Path(__file__).resolve().parent
+_SPARK = None
 
 
 def _load_environment() -> None:
@@ -30,36 +28,12 @@ def _load_environment() -> None:
         load_dotenv()
 
 
-def _build_conn():
-    """Create a Databricks SQL connection."""
-    if databricks_sql is None:
-        raise ModuleNotFoundError(
-            "No module named 'databricks.sql'. "
-            "Instale dependencias con: python3 -m pip install -r requirements.txt "
-            "o ejecute: bash scripts/setup_cloud_env.sh"
-        )
-
-    required = [
-        "DATABRICKS_SERVER_HOSTNAME",
-        "DATABRICKS_HTTP_PATH",
-    ]
-    missing = [var for var in required if not os.getenv(var)]
-    if not (os.getenv("DATABRICKS_ACCESS_TOKEN") or os.getenv("DATABRICKS_TOKEN")):
-        missing.append("DATABRICKS_ACCESS_TOKEN/DATABRICKS_TOKEN")
-    if missing:
-        raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
-
-    conn_kwargs = {
-        "server_hostname": os.getenv("DATABRICKS_SERVER_HOSTNAME"),
-        "http_path": os.getenv("DATABRICKS_HTTP_PATH"),
-        "access_token": os.getenv("DATABRICKS_ACCESS_TOKEN") or os.getenv("DATABRICKS_TOKEN"),
-        "_user_agent_entry": "FT3_DAILY_PIPELINE",
-    }
-    if os.getenv("DATABRICKS_CATALOG"):
-        conn_kwargs["catalog"] = os.getenv("DATABRICKS_CATALOG")
-    if os.getenv("DATABRICKS_SCHEMA"):
-        conn_kwargs["schema"] = os.getenv("DATABRICKS_SCHEMA")
-    return databricks_sql.connect(**conn_kwargs)
+def _get_spark():
+    """Get active Spark session from Databricks runtime."""
+    global _SPARK
+    if _SPARK is None:
+        _SPARK = get_spark_session()
+    return _SPARK
 
 
 def _split_sql_statements(query_content: str) -> list[str]:
@@ -143,11 +117,10 @@ def _split_sql_statements(query_content: str) -> list[str]:
     return statements
 
 
-def _execute_sql(conn,
-                 sql_path: Path,
+def _execute_sql(sql_path: Path,
                  label: str,
                  summary: str) -> None:
-    """Execute a SQL file inside the shared Databricks session."""
+    """Execute a SQL file using shared Spark session."""
     print(f"\nPASO {label}: Ejecutando {sql_path.name}...")
     print("----------------------------------------")
 
@@ -162,28 +135,17 @@ def _execute_sql(conn,
         print(f"⚠️  {sql_path.name} no contiene sentencias ejecutables")
         return
 
-    cursor = conn.cursor()
+    spark = _get_spark()
     start_time = datetime.now()
     try:
         for statement in statements:
-            cursor.execute(statement)
-        try:
-            conn.commit()
-        except Exception:
-            # Some DB-API connectors autocommit.
-            pass
+            spark.sql(statement)
         elapsed = (datetime.now() - start_time).total_seconds()
         print(f"✅ {sql_path.name} ejecutada en {elapsed:.1f} segundos ({len(statements)} sentencias)")
         print(f"   {summary}")
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"❌ Error en {sql_path.name}: {exc}")
         raise
-    finally:
-        cursor.close()
 
 
 def main() -> int:
@@ -195,17 +157,21 @@ def main() -> int:
     _load_environment()
 
     try:
-        conn = _build_conn()
+        spark = _get_spark()
     except Exception as exc:
-        print(f"❌ No fue posible conectar a Databricks SQL: {exc}")
+        print(f"❌ No fue posible iniciar Spark en Databricks: {exc}")
         return 1
 
     loader = SnowflakeDataLoader()
-    loader.conn = conn
     try:
-        loader.cursor = conn.cursor()
-    except Exception:
-        loader.cursor = None
+        loader.connect()
+        # Keep explicit binding for shared-session consistency.
+        loader.spark = spark
+        if loader.conn is not None:
+            loader.conn.spark = spark
+    except Exception as exc:
+        print(f"❌ No fue posible inicializar loader Spark: {exc}")
+        return 1
 
     step_summaries = []
 
@@ -213,7 +179,6 @@ def main() -> int:
         day_of_week = datetime.now().isoweekday()
         if day_of_week == 1:
             _execute_sql(
-                conn,
                 BASE_DIR / "query_lunes.sql",
                 "1a",
                 "Licencias del fin de semana cargadas",
@@ -221,7 +186,6 @@ def main() -> int:
             step_summaries.append("1a. query_lunes.sql: Licencias del fin de semana cargadas")
 
             _execute_sql(
-                conn,
                 BASE_DIR / "query_diaria.sql",
                 "1b",
                 "Licencias del día anterior cargadas",
@@ -229,7 +193,6 @@ def main() -> int:
             step_summaries.append("1b. query_diaria.sql: Licencias del día anterior cargadas")
         else:
             _execute_sql(
-                conn,
                 BASE_DIR / "query_diaria.sql",
                 "1",
                 "Licencias del día anterior cargadas",
@@ -237,7 +200,6 @@ def main() -> int:
             step_summaries.append("1. query_diaria.sql: Licencias del día anterior cargadas")
 
         _execute_sql(
-            conn,
             BASE_DIR / "query_2.sql",
             "2",
             "Tabla MODELO_LM_202507_TRAIN actualizada",
@@ -267,7 +229,7 @@ def main() -> int:
         return 1
     finally:
         try:
-            conn.close()
+            loader.disconnect()
         except Exception:
             pass
 
