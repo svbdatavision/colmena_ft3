@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Generate a client-ready 3-sheet inventory workbook for CERT AFP."""
+"""Generate a client-ready 3-sheet inventory workbook for a model."""
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -10,11 +11,18 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
-def build_modelos_df() -> pd.DataFrame:
+def _slugify(name: str) -> str:
+    slug = "".join(ch if ch.isalnum() else "_" for ch in name.strip().lower())
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_") or "modelo"
+
+
+def build_modelos_df(model_name: str) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Objetivo": (
                     "Predecir probabilidad de aprobación de licencias médicas para priorizar "
                     "auto-aprobación y reducir revisión manual."
@@ -41,11 +49,11 @@ def build_modelos_df() -> pd.DataFrame:
     )
 
 
-def build_inputs_df() -> pd.DataFrame:
+def build_inputs_df(model_name: str) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Tabla SQL (ingesta diaria)",
                 "Nombre": "SBN_LM_INPUT_DIARIO_ALFIL",
                 "Ruta Origen Detectada": "query_diaria.sql / query_lunes.sql",
@@ -57,7 +65,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Fuente principal de licencias nuevas.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Tabla SQL (histórico base)",
                 "Nombre": "CPA_LM_BASE_AMPLIADA",
                 "Ruta Origen Detectada": "query_diaria.sql / query_lunes.sql",
@@ -67,7 +75,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Se usa para consolidación/atributos históricos.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Tabla SQL (feature table intermedia)",
                 "Nombre": "MODELO_LM_202507_OPTIMIZADO",
                 "Ruta Origen Detectada": "query_diaria.sql / query_lunes.sql / query_2.sql",
@@ -79,7 +87,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Input directo para construir tabla TRAIN.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Tabla SQL (training/scoring)",
                 "Nombre": "MODELO_LM_202507_TRAIN",
                 "Ruta Origen Detectada": "query_2.sql / FT3_dia.py / FT30.py",
@@ -89,7 +97,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Tabla principal consumida por scoring diario.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Archivo artefacto ML",
                 "Nombre": "fasttrack_model.pkl",
                 "Ruta Origen Detectada": (
@@ -101,7 +109,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Requerido por FT3_dia.py y FT30.py para inferencia.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Archivo transformers ML",
                 "Nombre": "feature_fasttrack.pkl",
                 "Ruta Origen Detectada": (
@@ -113,7 +121,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Requerido para aplicar encoding/TF-IDF en scoring.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Archivo configuración",
                 "Nombre": "config.yaml",
                 "Ruta Origen Detectada": "/workspace/config.yaml",
@@ -123,7 +131,7 @@ def build_inputs_df() -> pd.DataFrame:
                 "Observaciones": "Define DB/schema y parámetros del modelo.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Input": "Archivo definición de features",
                 "Nombre": "Variables_cat_train.py",
                 "Ruta Origen Detectada": "/workspace/Variables_cat_train.py",
@@ -138,11 +146,11 @@ def build_inputs_df() -> pd.DataFrame:
     )
 
 
-def build_outputs_df() -> pd.DataFrame:
+def build_outputs_df(model_name: str) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Output": "Tabla SQL (dataset train actualizado)",
                 "Nombre": "MODELO_LM_202507_TRAIN",
                 "Ubicación Actual Detectada": (
@@ -155,7 +163,7 @@ def build_outputs_df() -> pd.DataFrame:
                 "Observaciones": "Se recrea en cada corrida de query_2.sql.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Output": "Tabla SQL (predicciones diarias)",
                 "Nombre": "FT30_PREDICCIONES_DIARIAS",
                 "Ubicación Actual Detectada": (
@@ -168,7 +176,7 @@ def build_outputs_df() -> pd.DataFrame:
                 "Observaciones": "Incluye con dictamen + pendientes; MERGE para evitar duplicados.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Output": "Tabla SQL (pendientes)",
                 "Nombre": "FT30_LICENCIAS_PENDIENTES",
                 "Ubicación Actual Detectada": (
@@ -181,7 +189,7 @@ def build_outputs_df() -> pd.DataFrame:
                 "Observaciones": "Solo licencias pendientes; actualizada por MERGE.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Output": "Archivo reporte diario",
                 "Nombre": "reporte_dia_YYYYMMDD_HHMMSS.(xlsx|csv)",
                 "Ubicación Actual Detectada": "results/ (creado automáticamente desde FT3_dia.py)",
@@ -190,7 +198,7 @@ def build_outputs_df() -> pd.DataFrame:
                 "Observaciones": "Si falta openpyxl, genera CSV de fallback.",
             },
             {
-                "Modelo": "CERT AFP",
+                "Modelo": model_name,
                 "Tipo Output": "Archivo reporte rango",
                 "Nombre": "reporte_completo_YYYYMMDD_HHMMSS.(xlsx|csv)",
                 "Ubicación Actual Detectada": "results/ (creado automáticamente desde FT30.py)",
@@ -231,13 +239,24 @@ def format_workbook(path: Path) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate 3-sheet client workbook (Modelos/Inputs/Outputs)."
+    )
+    parser.add_argument(
+        "--model-name",
+        default="FT3",
+        help="Model name to populate in the workbook (default: FT3).",
+    )
+    args = parser.parse_args()
+
+    model_name = args.model_name.strip() or "FT3"
     output_dir = Path("/workspace/deliverables")
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "CERT_AFP_modelo_inputs_outputs_databricks.xlsx"
+    out_path = output_dir / f"{_slugify(model_name).upper()}_modelo_inputs_outputs_databricks.xlsx"
 
-    modelos_df = build_modelos_df()
-    inputs_df = build_inputs_df()
-    outputs_df = build_outputs_df()
+    modelos_df = build_modelos_df(model_name)
+    inputs_df = build_inputs_df(model_name)
+    outputs_df = build_outputs_df(model_name)
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         modelos_df.to_excel(writer, sheet_name="Modelos", index=False)
