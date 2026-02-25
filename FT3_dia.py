@@ -23,6 +23,8 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 import os
+import re
+import importlib.util
 import sys
 sys.path.append('src')
 from sklearn.metrics import confusion_matrix
@@ -76,6 +78,42 @@ def _resolve_artifact_path(filename: str, env_var: str) -> str:
         f"No se encontró el artefacto requerido: {filename}\n"
         f"Rutas revisadas:\n{searched}"
     )
+
+
+def _to_spark_sql_type(type_name: str) -> str:
+    """Convert Snowflake-like SQL type string to Spark SQL type."""
+    t = type_name.strip().upper()
+    if t.startswith("VARCHAR"):
+        return "STRING"
+    if t.startswith("TIMESTAMP_NTZ"):
+        return "TIMESTAMP"
+    if t == "FLOAT":
+        return "DOUBLE"
+
+    number_match = re.match(r"NUMBER\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", t)
+    if number_match:
+        scale = int(number_match.group(2))
+        return "BIGINT" if scale == 0 else "DOUBLE"
+
+    if t == "NUMBER":
+        return "DOUBLE"
+    return type_name
+
+
+def _normalize_snowflake_ddl(ddl: str) -> str:
+    """Normalize Snowflake-oriented DDL to Spark-compatible SQL."""
+    out = ddl
+    out = re.sub(r"\bTIMESTAMP_NTZ\s*(\(\s*\d+\s*\))?", "TIMESTAMP", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bVARCHAR\s*\(\s*\d+\s*\)", "STRING", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bFLOAT\b", "DOUBLE", out, flags=re.IGNORECASE)
+
+    def number_repl(match):
+        scale = int(match.group(2))
+        return "BIGINT" if scale == 0 else "DOUBLE"
+
+    out = re.sub(r"\bNUMBER\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", number_repl, out, flags=re.IGNORECASE)
+    out = re.sub(r"\bNUMBER\b", "DOUBLE", out, flags=re.IGNORECASE)
+    return out
 
 
 def _write_dataframe_to_table(conn, df, table_name, batch_size=200, **_kwargs):
@@ -868,7 +906,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             )
             """
             
-            cursor.execute(create_daily_table)
+            cursor.execute(_normalize_snowflake_ddl(create_daily_table))
             print(f"      ✓ Tabla {tabla_diaria} creada/verificada")
             
             # Crear tabla temporal para el MERGE
@@ -1255,7 +1293,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     LEAK_FALLO_PE VARCHAR(255)
                 )
                 """
-                cursor.execute(create_pendientes_table)
+                cursor.execute(_normalize_snowflake_ddl(create_pendientes_table))
                 print(f"      ✓ Tabla {tabla_pendientes} creada")
             else:
                 print(f"   - Tabla {tabla_pendientes} ya existe")
@@ -1355,6 +1393,48 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         # 8. GENERAR REPORTE EXCEL
         print("\n8. Generando reporte Excel diario...")
         filename = f'results/reporte_dia_{timestamp}.xlsx'
+
+        if importlib.util.find_spec("openpyxl") is None:
+            print("   ⚠ openpyxl no disponible. Generando reporte CSV alternativo...")
+            filename = f"results/reporte_dia_{timestamp}.csv"
+            resumen_csv = pd.DataFrame(
+                {
+                    "Métrica": [
+                        "Período",
+                        "Total licencias procesadas",
+                        "Con dictamen",
+                        "Pendientes",
+                        "Umbral verde",
+                        "Umbral amarillo",
+                    ],
+                    "Valor": [
+                        f"{date_from} al {date_to}",
+                        int(total_licencias),
+                        int(len(info_con_dictamen)),
+                        int(len(info_pendientes)),
+                        float(optimal_verde),
+                        float(optimal_amarillo),
+                    ],
+                }
+            )
+            resumen_csv.to_csv(filename, index=False)
+            info_pendientes_sorted.to_csv(
+                f"results/reporte_dia_{timestamp}_licencias_pendientes.csv",
+                index=False,
+            )
+            if len(info_con_dictamen) > 0:
+                info_con_dictamen.to_csv(
+                    f"results/reporte_dia_{timestamp}_con_dictamen.csv",
+                    index=False,
+                )
+            print(f"\n✓ Reporte CSV guardado en: {filename}")
+            print("   (Instalá openpyxl para salida XLSX)")
+            print(f"\n✓ DATABRICKS SQL: Tablas actualizadas:")
+            print(f"  - FT30_PREDICCIONES_DIARIAS: Todas las predicciones del día")
+            print(f"  - FT30_LICENCIAS_PENDIENTES: Solo licencias pendientes")
+            if disconnect_after:
+                loader.disconnect()
+            return filename
         
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
             # Resumen ejecutivo
