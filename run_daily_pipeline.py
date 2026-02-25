@@ -18,6 +18,17 @@ BASE_DIR = Path(__file__).resolve().parent
 _SPARK = None
 
 
+def _running_in_notebook() -> bool:
+    """Return True when executed inside a notebook kernel."""
+    try:
+        from IPython import get_ipython
+    except Exception:
+        return False
+
+    shell = get_ipython()
+    return shell is not None and shell.__class__.__name__ == "ZMQInteractiveShell"
+
+
 def _load_environment() -> None:
     """Load environment variables from .env if present."""
     dotenv_candidate = os.environ.get("DOTENV_PATH", "/app/.env")
@@ -149,6 +160,9 @@ def _execute_sql(sql_path: Path,
 
 
 def main() -> int:
+    # Ensure relative paths (models/, results/, etc.) resolve from project root.
+    os.chdir(BASE_DIR)
+
     print("=" * 42)
     print("INICIANDO PIPELINE DIARIO FT3")
     print(f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}")
@@ -232,12 +246,8 @@ def main() -> int:
             loader.disconnect()
         except Exception:
             pass
-
-
-def _entrypoint() -> None:
-    status = main()
-    sys.exit(status)
-
-
 if __name__ == "__main__":
-    _entrypoint()
+    if _running_in_notebook():
+        main()
+    else:
+        sys.exit(main())

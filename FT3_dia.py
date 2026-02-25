@@ -21,6 +21,8 @@ ACTUALIZACIÓN 2025-09-05:
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from pathlib import Path
+import os
 import sys
 sys.path.append('src')
 from sklearn.metrics import confusion_matrix
@@ -30,6 +32,50 @@ from src.data_loader import SnowflakeDataLoader
 from src.feature_engineering import FeatureEngineer
 from src.model_training import LightGBMTrainer
 import joblib
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_artifact_path(filename: str, env_var: str) -> str:
+    """Resolve model/transformer artifact path across Databricks runtime locations."""
+    candidates = []
+
+    explicit = os.getenv(env_var, "").strip()
+    if explicit:
+        explicit_path = Path(explicit)
+        if explicit_path.is_dir():
+            candidates.append(explicit_path / filename)
+        else:
+            candidates.append(explicit_path)
+
+    models_root = os.getenv("MODELS_PATH", "").strip()
+    if models_root:
+        candidates.append(Path(models_root) / filename)
+
+    candidates.extend([
+        BASE_DIR / "models" / filename,
+        Path.cwd() / "models" / filename,
+        Path("/dbfs") / "models" / filename,
+        Path("/dbfs") / "FileStore" / "models" / filename,
+    ])
+
+    seen = set()
+    deduped = []
+    for candidate in candidates:
+        normalized = str(candidate)
+        if normalized not in seen:
+            deduped.append(candidate)
+            seen.add(normalized)
+
+    for candidate in deduped:
+        if candidate.is_file():
+            return str(candidate)
+
+    searched = "\n".join(f" - {path}" for path in deduped)
+    raise FileNotFoundError(
+        f"No se encontró el artefacto requerido: {filename}\n"
+        f"Rutas revisadas:\n{searched}"
+    )
 
 
 def _write_dataframe_to_table(conn, df, table_name, batch_size=200, **_kwargs):
@@ -75,12 +121,15 @@ def _write_dataframe_to_table(conn, df, table_name, batch_size=200, **_kwargs):
         cursor.close()
 
 
-def align_features_with_model(X, model_path="models/fasttrack_model.pkl"):
+def align_features_with_model(X, model_path=None):
     """
     Aligns the features of the transformed data with what the model expects.
     This handles cases where feature engineering produces a different number of features.
     """
     # Load model to get expected features
+    if model_path is None:
+        model_path = _resolve_artifact_path("fasttrack_model.pkl", "FASTTRACK_MODEL_PATH")
+
     model_data = joblib.load(model_path)
     expected_features = model_data.get('feature_names', None)
     
@@ -289,9 +338,11 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         loader = SnowflakeDataLoader()
         created_loader = True
     trainer = LightGBMTrainer()
-    trainer.load_model('models/fasttrack_model.pkl')
+    model_path = _resolve_artifact_path("fasttrack_model.pkl", "FASTTRACK_MODEL_PATH")
+    transformer_path = _resolve_artifact_path("feature_fasttrack.pkl", "FEATURE_TRANSFORMERS_PATH")
+    trainer.load_model(model_path)
     engineer = FeatureEngineer()
-    engineer.load_transformers('models/feature_fasttrack.pkl')
+    engineer.load_transformers(transformer_path)
     
     disconnect_after = False
 
@@ -450,7 +501,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             print("   - Prediciendo licencias con dictamen...")
             try:
                 X_con_dictamen = engineer.transform(df_con_dictamen_pred)
-                X_con_dictamen = align_features_with_model(X_con_dictamen)
+                X_con_dictamen = align_features_with_model(X_con_dictamen, model_path=model_path)
                 prob_con_dictamen = trainer.predict(X_con_dictamen)  # Ya es P(TARGET_FT3=1)
                 print(f"   ✓ Predicciones completadas para {len(prob_con_dictamen):,} licencias con dictamen")
             except Exception as e:
@@ -467,7 +518,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             try:
                 # El feature engineering manejará automáticamente las columnas faltantes
                 X_pendientes = engineer.transform(df_pendientes_pred)
-                X_pendientes = align_features_with_model(X_pendientes)
+                X_pendientes = align_features_with_model(X_pendientes, model_path=model_path)
                 prob_pendientes = trainer.predict(X_pendientes)  # Ya es P(TARGET_FT3=1)
                 print(f"   ✓ Predicciones completadas para {len(prob_pendientes):,} licencias pendientes")
             except Exception as e:
