@@ -116,6 +116,18 @@ def _normalize_snowflake_ddl(ddl: str) -> str:
     return out
 
 
+def _qualified_table_name(loader, table_name: str) -> str:
+    """Build fully-qualified table name from loader config when available."""
+    params = getattr(loader, "connection_params", {}) or {}
+    database = str(params.get("database", "")).strip()
+    schema = str(params.get("schema", "")).strip()
+    if database and schema:
+        return f"{database}.{schema}.{table_name}"
+    if schema:
+        return f"{schema}.{table_name}"
+    return table_name
+
+
 def _write_dataframe_to_table(conn, df, table_name, batch_size=200, **_kwargs):
     """
     Reemplazo compatible de write_pandas usando executemany sobre DB-API.
@@ -848,7 +860,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     df_daily[col] = df_daily[col].dt.strftime('%Y-%m-%d %H:%M:%S').where(pd.notnull(df_daily[col]), None)
             
             # Tabla de predicciones diarias
-            tabla_diaria = "FT30_PREDICCIONES_DIARIAS"
+            tabla_diaria = _qualified_table_name(loader, "FT30_PREDICCIONES_DIARIAS")
             
             # Verificar si la tabla existe
             cursor = loader.conn.cursor()
@@ -1232,71 +1244,61 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     df_snowflake_pendientes[col] = df_snowflake_pendientes[col].dt.strftime('%Y-%m-%d %H:%M:%S').where(pd.notnull(df_snowflake_pendientes[col]), None)
             
             # Nombre de la tabla fija (sin timestamp)
-            tabla_pendientes = "FT30_LICENCIAS_PENDIENTES"
+            tabla_pendientes = _qualified_table_name(loader, "FT30_LICENCIAS_PENDIENTES")
             
-            # Verificar si la tabla existe y obtener licencias ya procesadas
+            # Verificar/crear tabla destino de pendientes
             cursor = loader.conn.cursor()
-            
-            # Verificar si la tabla existe
-            cursor.execute(f"SHOW TABLES LIKE '{tabla_pendientes}'")
-            table_exists = cursor.fetchone() is not None
-            
-            if not table_exists:
-                # Si la tabla no existe, crearla con el schema correcto
-                print(f"   - Creando tabla {tabla_pendientes} por primera vez...")
-                create_pendientes_table = f"""
-                CREATE TABLE {tabla_pendientes} (
-                    -- Primeros 20 campos (sin LCC_OPERADOR que no existe)
-                    AFILIADO_RUT VARCHAR(11),
-                    LCC_COMCOD NUMBER(38,0),
-                    LCC_COMCOR NUMBER(38,0),
-                    LCC_OPERADOR NUMBER(38,0),  -- NULL siempre, no existe en datos
-                    LCC_MEDRUT VARCHAR(11),     -- Viene de PRESTADOR_RUT
-                    LCC_EMPRUT VARCHAR(11),     -- Viene de EMPLEADOR_RUT
-                    LCC_IDN VARCHAR(20),        -- Ampliado para acomodar valores más largos
-                    EPISODIO_ACUM_DIAS NUMBER(38,0),
-                    EPISODIO_FEC_INI DATE,
-                    CONTINUA_CALC VARCHAR(1),
-                    TIPO_F_LM_COD NUMBER(38,0),
-                    TIPO_F_LM VARCHAR(35),
-                    FECHA_RECEPCION TIMESTAMP_NTZ(3),
-                    FECHA_INICIO TIMESTAMP_NTZ(3),
-                    FECHA_TERMINO TIMESTAMP_NTZ(3),
-                    DIASSOLICITADO NUMBER(38,0),
-                    CIE_F VARCHAR(120),
-                    CIE_F_COD VARCHAR(12),
-                    CIE_GRUPO VARCHAR(30),
-                    LM_DIAGNOSTICO VARCHAR(100),
-                    LM_ANTECEDENTES_CLINICOS VARCHAR(100),
-                    -- Campos adicionales de afiliado
-                    COT_EDAD NUMBER(38,0),
-                    COT_GENERO VARCHAR(4),
-                    RENTA_ESTIMADA FLOAT,
-                    -- Campos del modelo
-                    SEMAFORO VARCHAR(20),
-                    PROBABILIDAD_APROBACION FLOAT,
-                    UMBRAL_VERDE FLOAT,
-                    UMBRAL_AMARILLO FLOAT,
-                    FECHA_PROCESAMIENTO TIMESTAMP_NTZ,
-                    FECHA_PROCESAMIENTO_STR VARCHAR(50),
-                    MODELO_VERSION VARCHAR(10),
-                    TARGET_FT3 NUMBER(1,0),
-                    TARGET_APRUEBA NUMBER(1,0),
-                    GLOSA_GENERADA VARCHAR(500),
-                    CAUSAL_GENERADA VARCHAR(100),
-                    -- Campos LEAK para validación
-                    LEAK_FT VARCHAR(100),
-                    LEAK_CAUSALES VARCHAR(500),
-                    LEAK_DIASAUTORIZADOS NUMBER(38,0),
-                    LEAK_GLOSAS VARCHAR(500),
-                    LEAK_ESTADOLM VARCHAR(35),
-                    LEAK_FALLO_PE VARCHAR(255)
-                )
-                """
-                cursor.execute(_normalize_snowflake_ddl(create_pendientes_table))
-                print(f"      ✓ Tabla {tabla_pendientes} creada")
-            else:
-                print(f"   - Tabla {tabla_pendientes} ya existe")
+            create_pendientes_table = f"""
+            CREATE TABLE IF NOT EXISTS {tabla_pendientes} (
+                -- Primeros 20 campos (sin LCC_OPERADOR que no existe)
+                AFILIADO_RUT VARCHAR(11),
+                LCC_COMCOD NUMBER(38,0),
+                LCC_COMCOR NUMBER(38,0),
+                LCC_OPERADOR NUMBER(38,0),  -- NULL siempre, no existe en datos
+                LCC_MEDRUT VARCHAR(11),     -- Viene de PRESTADOR_RUT
+                LCC_EMPRUT VARCHAR(11),     -- Viene de EMPLEADOR_RUT
+                LCC_IDN VARCHAR(20),        -- Ampliado para acomodar valores más largos
+                EPISODIO_ACUM_DIAS NUMBER(38,0),
+                EPISODIO_FEC_INI DATE,
+                CONTINUA_CALC VARCHAR(1),
+                TIPO_F_LM_COD NUMBER(38,0),
+                TIPO_F_LM VARCHAR(35),
+                FECHA_RECEPCION TIMESTAMP_NTZ(3),
+                FECHA_INICIO TIMESTAMP_NTZ(3),
+                FECHA_TERMINO TIMESTAMP_NTZ(3),
+                DIASSOLICITADO NUMBER(38,0),
+                CIE_F VARCHAR(120),
+                CIE_F_COD VARCHAR(12),
+                CIE_GRUPO VARCHAR(30),
+                LM_DIAGNOSTICO VARCHAR(100),
+                LM_ANTECEDENTES_CLINICOS VARCHAR(100),
+                -- Campos adicionales de afiliado
+                COT_EDAD NUMBER(38,0),
+                COT_GENERO VARCHAR(4),
+                RENTA_ESTIMADA FLOAT,
+                -- Campos del modelo
+                SEMAFORO VARCHAR(20),
+                PROBABILIDAD_APROBACION FLOAT,
+                UMBRAL_VERDE FLOAT,
+                UMBRAL_AMARILLO FLOAT,
+                FECHA_PROCESAMIENTO TIMESTAMP_NTZ,
+                FECHA_PROCESAMIENTO_STR VARCHAR(50),
+                MODELO_VERSION VARCHAR(10),
+                TARGET_FT3 NUMBER(1,0),
+                TARGET_APRUEBA NUMBER(1,0),
+                GLOSA_GENERADA VARCHAR(500),
+                CAUSAL_GENERADA VARCHAR(100),
+                -- Campos LEAK para validación
+                LEAK_FT VARCHAR(100),
+                LEAK_CAUSALES VARCHAR(500),
+                LEAK_DIASAUTORIZADOS NUMBER(38,0),
+                LEAK_GLOSAS VARCHAR(500),
+                LEAK_ESTADOLM VARCHAR(35),
+                LEAK_FALLO_PE VARCHAR(255)
+            )
+            """
+            cursor.execute(_normalize_snowflake_ddl(create_pendientes_table))
+            print(f"   - Tabla {tabla_pendientes} creada/verificada")
             
             # Crear tabla temporal para MERGE de pendientes
             tabla_temp_pend = f"{tabla_pendientes}_TEMP"
@@ -1392,11 +1394,13 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         
         # 8. GENERAR REPORTE EXCEL
         print("\n8. Generando reporte Excel diario...")
-        filename = f'results/reporte_dia_{timestamp}.xlsx'
+        results_dir = BASE_DIR / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        filename = str(results_dir / f"reporte_dia_{timestamp}.xlsx")
 
         if importlib.util.find_spec("openpyxl") is None:
             print("   ⚠ openpyxl no disponible. Generando reporte CSV alternativo...")
-            filename = f"results/reporte_dia_{timestamp}.csv"
+            filename = str(results_dir / f"reporte_dia_{timestamp}.csv")
             resumen_csv = pd.DataFrame(
                 {
                     "Métrica": [
@@ -1419,12 +1423,12 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             )
             resumen_csv.to_csv(filename, index=False)
             info_pendientes_sorted.to_csv(
-                f"results/reporte_dia_{timestamp}_licencias_pendientes.csv",
+                str(results_dir / f"reporte_dia_{timestamp}_licencias_pendientes.csv"),
                 index=False,
             )
             if len(info_con_dictamen) > 0:
                 info_con_dictamen.to_csv(
-                    f"results/reporte_dia_{timestamp}_con_dictamen.csv",
+                    str(results_dir / f"reporte_dia_{timestamp}_con_dictamen.csv"),
                     index=False,
                 )
             print(f"\n✓ Reporte CSV guardado en: {filename}")
