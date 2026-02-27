@@ -406,31 +406,76 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         # 1. CARGAR TODAS LAS LICENCIAS DEL PERÍODO
         print("\n1. Cargando licencias del período...")
         
+        tabla_train = _qualified_table_name(loader, "MODELO_LM_202507_TRAIN")
+
         # SIEMPRE usar MODELO_LM_202507_TRAIN
         # Si no se especifican fechas, cargar solo licencias sin dictamen
+        strict_cie_filter = """
+        CIE_GRUPO NOT IN ('PARTO', 'PUERPERIO')
+        AND CIE_GRUPO IS NOT NULL
+        AND TRIM(CIE_GRUPO) != ''
+        """
+        relaxed_cie_filter = """
+        (CIE_GRUPO NOT IN ('PARTO', 'PUERPERIO') OR CIE_GRUPO IS NULL OR TRIM(CIE_GRUPO) = '')
+        """
+
         if date_from == date_to and date_from == yesterday:
             print("   Modo: Procesando SOLO licencias sin dictamen (pendientes)")
-            query_todas = """
+            query_todas = f"""
             SELECT *
-            FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_TRAIN
+            FROM {tabla_train}
             WHERE TARGET_APRUEBA IS NULL
-            AND CIE_GRUPO NOT IN ('PARTO', 'PUERPERIO')
-            AND CIE_GRUPO IS NOT NULL
-            AND TRIM(CIE_GRUPO) != ''
+            AND {strict_cie_filter}
             """
         else:
             # Si se especifican fechas, usar el filtro de fechas
             print("   Modo: Procesando licencias del período especificado")
             query_todas = f"""
             SELECT *
-            FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_TRAIN
+            FROM {tabla_train}
             WHERE FECHA_RECEPCION BETWEEN '{date_from}' AND '{date_to}'
-            AND CIE_GRUPO NOT IN ('PARTO', 'PUERPERIO')
-            AND CIE_GRUPO IS NOT NULL
-            AND TRIM(CIE_GRUPO) != ''
+            AND {strict_cie_filter}
             """
-        
+
         df_todas = loader.execute_query(query_todas)
+
+        # Fallback: si no hay filas con filtro estricto pero sí hay candidatos en TRAIN,
+        # relajar filtro de CIE_GRUPO para no perder pendientes por datos incompletos.
+        if len(df_todas) == 0:
+            if date_from == date_to and date_from == yesterday:
+                diagnostics_query = f"""
+                SELECT COUNT(*) AS TOTAL_CANDIDATOS
+                FROM {tabla_train}
+                WHERE TARGET_APRUEBA IS NULL
+                """
+                fallback_query = f"""
+                SELECT *
+                FROM {tabla_train}
+                WHERE TARGET_APRUEBA IS NULL
+                AND {relaxed_cie_filter}
+                """
+            else:
+                diagnostics_query = f"""
+                SELECT COUNT(*) AS TOTAL_CANDIDATOS
+                FROM {tabla_train}
+                WHERE FECHA_RECEPCION BETWEEN '{date_from}' AND '{date_to}'
+                """
+                fallback_query = f"""
+                SELECT *
+                FROM {tabla_train}
+                WHERE FECHA_RECEPCION BETWEEN '{date_from}' AND '{date_to}'
+                AND {relaxed_cie_filter}
+                """
+
+            diagnostics_df = loader.execute_query(diagnostics_query)
+            total_candidates = int(diagnostics_df.iloc[0]["TOTAL_CANDIDATOS"]) if not diagnostics_df.empty else 0
+            if total_candidates > 0:
+                print(
+                    "   ⚠ Filtro estricto devolvió 0 filas. "
+                    "Se aplica fallback permitiendo CIE_GRUPO nulo/vacío."
+                )
+                df_todas = loader.execute_query(fallback_query)
+
         print(f"   Total licencias cargadas: {len(df_todas):,}")
         
         # Separar en con dictamen y pendientes basado en TARGET_APRUEBA
