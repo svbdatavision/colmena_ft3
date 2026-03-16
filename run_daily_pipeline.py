@@ -19,7 +19,11 @@ from FT3_dia import apply_model_to_all_licenses
 from src.data_loader import SnowflakeDataLoader
 from src.spark_sql_compat import get_spark_session
 
-BASE_DIR = Path(__file__).resolve().parent
+if "__file__" in globals():
+    BASE_DIR = Path(__file__).resolve().parent
+else:
+    # When running in Databricks notebook, __file__ is not defined.
+    BASE_DIR = Path(os.getcwd())
 _SPARK = None
 
 
