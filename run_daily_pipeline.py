@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import io
 import os
 import sys
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from urllib.error import URLError, HTTPError
+from urllib.request import Request, urlopen
+import json
 
 try:
     import databricks.sql as databricks_sql
@@ -18,6 +23,71 @@ from FT3_dia import apply_model_to_all_licenses
 from src.data_loader import SnowflakeDataLoader
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+class _TeeStream:
+    """Write stdout both to console and in-memory buffer."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def _get_teams_webhook_url() -> str:
+    """Return Teams webhook URL from environment, if configured."""
+    return (
+        os.getenv("TEAMS_WEBHOOK_URL", "").strip()
+        or os.getenv("MSTEAMS_WEBHOOK_URL", "").strip()
+    )
+
+
+def _send_teams_alert(webhook_url: str, message: str) -> None:
+    """Send a plain text notification to Microsoft Teams incoming webhook."""
+    if not webhook_url:
+        return
+
+    payload = json.dumps({"text": message}).encode("utf-8")
+    req = Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=15):
+            pass
+    except (HTTPError, URLError, TimeoutError) as exc:
+        print(f"⚠ No se pudo enviar alerta a Teams: {exc}")
+
+
+def _truncate_for_teams(text: str, max_chars: int = 26000) -> str:
+    """Trim oversized messages to avoid webhook payload issues."""
+    if len(text) <= max_chars:
+        return text
+    suffix = "\n\n...[mensaje truncado por longitud]..."
+    return text[: max_chars - len(suffix)] + suffix
+
+
+def _build_teams_final_message(status: int, started_at: datetime, finished_at: datetime, output: str) -> str:
+    """Build final Teams message with status and pipeline output."""
+    status_label = "COMPLETADO EXITOSAMENTE" if status == 0 else "FALLÓ"
+    status_icon = "✅" if status == 0 else "❌"
+    duration = (finished_at - started_at).total_seconds()
+    header = (
+        f"{status_icon} PIPELINE DIARIO FT3 {status_label}\n"
+        f"Inicio: {started_at:%Y-%m-%d %H:%M:%S}\n"
+        f"Fin: {finished_at:%Y-%m-%d %H:%M:%S}\n"
+        f"Duración: {duration:.1f}s\n\n"
+    )
+    return _truncate_for_teams(header + output.strip())
 
 
 def _load_environment() -> None:
@@ -187,89 +257,114 @@ def _execute_sql(conn,
 
 
 def main() -> int:
-    print("=" * 42)
-    print("INICIANDO PIPELINE DIARIO FT3")
-    print(f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}")
-    print("=" * 42)
-
     _load_environment()
+    teams_webhook_url = _get_teams_webhook_url()
+    started_at = datetime.now()
 
-    try:
-        conn = _build_conn()
-    except Exception as exc:
-        print(f"❌ No fue posible conectar a Databricks SQL: {exc}")
-        return 1
-
-    loader = SnowflakeDataLoader()
-    loader.conn = conn
-    try:
-        loader.cursor = conn.cursor()
-    except Exception:
-        loader.cursor = None
-
-    step_summaries = []
-
-    try:
-        day_of_week = datetime.now().isoweekday()
-        if day_of_week == 1:
-            _execute_sql(
-                conn,
-                BASE_DIR / "query_lunes.sql",
-                "1a",
-                "Licencias del fin de semana cargadas",
-            )
-            step_summaries.append("1a. query_lunes.sql: Licencias del fin de semana cargadas")
-
-            _execute_sql(
-                conn,
-                BASE_DIR / "query_diaria.sql",
-                "1b",
-                "Licencias del día anterior cargadas",
-            )
-            step_summaries.append("1b. query_diaria.sql: Licencias del día anterior cargadas")
-        else:
-            _execute_sql(
-                conn,
-                BASE_DIR / "query_diaria.sql",
-                "1",
-                "Licencias del día anterior cargadas",
-            )
-            step_summaries.append("1. query_diaria.sql: Licencias del día anterior cargadas")
-
-        _execute_sql(
-            conn,
-            BASE_DIR / "query_2.sql",
-            "2",
-            "Tabla MODELO_LM_202507_TRAIN actualizada",
+    if teams_webhook_url:
+        _send_teams_alert(
+            teams_webhook_url,
+            (
+                "🚀 INICIANDO PIPELINE DIARIO FT3\n"
+                f"Fecha: {started_at:%Y-%m-%d %H:%M:%S}"
+            ),
         )
-        step_summaries.append("2. query_2.sql: Tabla MODELO_LM_202507_TRAIN actualizada")
 
-        print("\nPASO 3: Ejecutando FT3_dia.py...")
-        print("----------------------------------------")
-        report_file = apply_model_to_all_licenses(loader=loader)
-        step_summaries.append("3. FT3_dia.py: Predicciones generadas")
-
-        print("\n" + "=" * 42)
-        print("✅ PIPELINE COMPLETADO EXITOSAMENTE")
-        print("Resumen del pipeline:")
-        for item in step_summaries:
-            print(f"  {item}")
-        if report_file:
-            print(f"  Reporte generado: {report_file}")
-        print(f"Hora finalización: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    captured_stdout = io.StringIO()
+    status = 1
+    with redirect_stdout(_TeeStream(sys.stdout, captured_stdout)):
+        print("=" * 42)
+        print("INICIANDO PIPELINE DIARIO FT3")
+        print(f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}")
         print("=" * 42)
 
-        return 0
-
-    except Exception as exc:
-        print("\n❌ Pipeline abortado")
-        print(f"Motivo: {exc}")
-        return 1
-    finally:
         try:
-            conn.close()
-        except Exception:
-            pass
+            conn = _build_conn()
+        except Exception as exc:
+            print(f"❌ No fue posible conectar a Databricks SQL: {exc}")
+            status = 1
+        else:
+            loader = SnowflakeDataLoader()
+            loader.conn = conn
+            try:
+                loader.cursor = conn.cursor()
+            except Exception:
+                loader.cursor = None
+
+            step_summaries = []
+
+            try:
+                day_of_week = datetime.now().isoweekday()
+                if day_of_week == 1:
+                    _execute_sql(
+                        conn,
+                        BASE_DIR / "query_lunes.sql",
+                        "1a",
+                        "Licencias del fin de semana cargadas",
+                    )
+                    step_summaries.append("1a. query_lunes.sql: Licencias del fin de semana cargadas")
+
+                    _execute_sql(
+                        conn,
+                        BASE_DIR / "query_diaria.sql",
+                        "1b",
+                        "Licencias del día anterior cargadas",
+                    )
+                    step_summaries.append("1b. query_diaria.sql: Licencias del día anterior cargadas")
+                else:
+                    _execute_sql(
+                        conn,
+                        BASE_DIR / "query_diaria.sql",
+                        "1",
+                        "Licencias del día anterior cargadas",
+                    )
+                    step_summaries.append("1. query_diaria.sql: Licencias del día anterior cargadas")
+
+                _execute_sql(
+                    conn,
+                    BASE_DIR / "query_2.sql",
+                    "2",
+                    "Tabla MODELO_LM_202507_TRAIN actualizada",
+                )
+                step_summaries.append("2. query_2.sql: Tabla MODELO_LM_202507_TRAIN actualizada")
+
+                print("\nPASO 3: Ejecutando FT3_dia.py...")
+                print("----------------------------------------")
+                report_file = apply_model_to_all_licenses(loader=loader)
+                step_summaries.append("3. FT3_dia.py: Predicciones generadas")
+
+                print("\n" + "=" * 42)
+                print("✅ PIPELINE COMPLETADO EXITOSAMENTE")
+                print("Resumen del pipeline:")
+                for item in step_summaries:
+                    print(f"  {item}")
+                if report_file:
+                    print(f"  Reporte generado: {report_file}")
+                print(f"Hora finalización: {datetime.now():%Y-%m-%d %H:%M:%S}")
+                print("=" * 42)
+                status = 0
+
+            except Exception as exc:
+                print("\n❌ Pipeline abortado")
+                print(f"Motivo: {exc}")
+                status = 1
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    if teams_webhook_url:
+        finished_at = datetime.now()
+        message = _build_teams_final_message(
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            output=captured_stdout.getvalue(),
+        )
+        _send_teams_alert(teams_webhook_url, message)
+
+    return status
 
 
 def _entrypoint() -> None:
