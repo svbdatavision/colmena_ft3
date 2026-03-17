@@ -12,6 +12,7 @@ from pathlib import Path
 import json
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -52,25 +53,87 @@ def _get_teams_webhook_url() -> str:
 
 
 def _send_teams_alert(webhook_url: str, message: str) -> None:
-    """Send a plain text notification to Microsoft Teams incoming webhook."""
+    """Send notification to Teams webhook with payload fallbacks.
+
+    Supports both:
+    - Legacy Incoming Webhook connectors.
+    - Teams Workflows/Power Automate webhook endpoints.
+    """
     if not webhook_url:
         return
 
-    payload = json.dumps({"text": message}).encode("utf-8")
-    req = Request(
-        webhook_url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=15):
-            pass
-    except (HTTPError, URLError, TimeoutError) as exc:
-        print(f"⚠ No se pudo enviar alerta a Teams: {exc}")
+    def _post_payload(payload_obj: Any) -> tuple[bool, str]:
+        payload = json.dumps(payload_obj).encode("utf-8")
+        req = Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=20):
+                return True, ""
+        except HTTPError as exc:
+            # Intentar leer body del error para diagnóstico.
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            return False, f"HTTP {exc.code}: {detail or str(exc)}"
+        except (URLError, TimeoutError) as exc:
+            return False, str(exc)
+
+    # Payloads en orden de preferencia/fallback.
+    payload_candidates = [
+        # Incoming webhook clásico
+        {"text": message},
+        # Connector card
+        {
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "summary": "FT3 pipeline",
+            "text": message.replace("\n", "<br>"),
+        },
+        # Workflows / Power Automate (Adaptive Card envelope)
+        {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard",
+                        "version": "1.4",
+                        "body": [
+                            {
+                                "type": "TextBlock",
+                                "text": "FT3 Pipeline",
+                                "weight": "Bolder",
+                                "wrap": True,
+                            },
+                            {
+                                "type": "TextBlock",
+                                "text": message,
+                                "wrap": True,
+                            },
+                        ],
+                    },
+                }
+            ],
+        },
+    ]
+
+    last_error = ""
+    for payload_obj in payload_candidates:
+        ok, error = _post_payload(payload_obj)
+        if ok:
+            return
+        last_error = error
+
+    print(f"⚠ No se pudo enviar alerta a Teams: {last_error}")
 
 
-def _split_text_for_teams(text: str, max_chars: int = 9000) -> list[str]:
+def _split_text_for_teams(text: str, max_chars: int = 3000) -> list[str]:
     """Divide texto largo en bloques aptos para webhook de Teams."""
     if not text:
         return [""]
@@ -102,7 +165,7 @@ def _split_text_for_teams(text: str, max_chars: int = 9000) -> list[str]:
 
 def _send_teams_log(webhook_url: str, title: str, full_log: str) -> None:
     """Envía el log completo en uno o varios mensajes a Teams."""
-    chunks = _split_text_for_teams(full_log.strip(), max_chars=9000)
+    chunks = _split_text_for_teams(full_log.strip(), max_chars=3000)
     total = len(chunks)
     if total == 0:
         _send_teams_alert(webhook_url, title)
@@ -110,8 +173,7 @@ def _send_teams_log(webhook_url: str, title: str, full_log: str) -> None:
 
     for idx, chunk in enumerate(chunks, start=1):
         header = f"{title}\n\nLog pipeline ({idx}/{total}):"
-        # Se envía en bloque de código para mantener formato y saltos de línea.
-        message = f"{header}\n```\n{chunk}\n```"
+        message = f"{header}\n{chunk}"
         _send_teams_alert(webhook_url, message)
 
 
