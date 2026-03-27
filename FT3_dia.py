@@ -1443,6 +1443,25 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         results_dir.mkdir(parents=True, exist_ok=True)
         filename = str(results_dir / f"reporte_dia_{timestamp}.xlsx")
 
+        # Robustez: en algunos escenarios info_pendientes puede venir vacío/sin columnas.
+        if 'SEMAFORO' in info_pendientes.columns:
+            ft1_aprobados_count = int((info_pendientes['SEMAFORO'] == 'FT1_APROBADO').sum())
+            verde_count = int((info_pendientes['SEMAFORO'] == 'VERDE').sum())
+            amarillo_count = int((info_pendientes['SEMAFORO'] == 'AMARILLO').sum())
+            rojo_count = int((info_pendientes['SEMAFORO'] == 'ROJO').sum())
+        else:
+            ft1_aprobados_count = 0
+            verde_count = 0
+            amarillo_count = 0
+            rojo_count = 0
+
+        if 'DIASSOLICITADO' in verde_pendientes.columns and len(verde_pendientes) > 0:
+            verde_dias_total = int(pd.to_numeric(
+                verde_pendientes['DIASSOLICITADO'], errors='coerce'
+            ).fillna(0).sum())
+        else:
+            verde_dias_total = 0
+
         if importlib.util.find_spec("openpyxl") is None:
             print("   ⚠ openpyxl no disponible. Generando reporte CSV alternativo...")
             filename = str(results_dir / f"reporte_dia_{timestamp}.csv")
@@ -1522,14 +1541,14 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     f"{len(info_pendientes):,}",
                     '',
                     '',
-                    f"{(info_pendientes['SEMAFORO'] == 'FT1_APROBADO').sum():,}",
-                    f"{(info_pendientes['SEMAFORO'] == 'VERDE').sum():,}",
-                    f"{(info_pendientes['SEMAFORO'] == 'AMARILLO').sum():,}",
-                    f"{(info_pendientes['SEMAFORO'] == 'ROJO').sum():,}",
+                    f"{ft1_aprobados_count:,}",
+                    f"{verde_count:,}",
+                    f"{amarillo_count:,}",
+                    f"{rojo_count:,}",
                     '',
                     '',
                     f"{len(verde_pendientes):,}" if len(verde_pendientes) > 0 else "0",
-                    f"{verde_pendientes['DIASSOLICITADO'].sum():,}" if len(verde_pendientes) > 0 else "0",
+                    f"{verde_dias_total:,}",
                     '',
                     '',
                     f"{precision:.1%}" if len(verde_con_dictamen) > 0 else "N/A",
