@@ -255,11 +255,21 @@ class FeatureEngineer:
         
         for col in all_numeric:
             if col in df.columns:
+                # Normalize potential Decimal/object values to numeric to avoid
+                # arithmetic errors later (e.g. float * decimal.Decimal).
+                numeric_series = pd.to_numeric(df[col], errors='coerce')
+
                 # Fill missing values with median for numeric, 0 for binary
                 if col in binary_cols:
-                    df[col] = df[col].fillna(0)
+                    df[col] = numeric_series.fillna(0)
                 else:
-                    df[col] = df[col].fillna(df[col].median())
+                    if numeric_series.notna().any():
+                        df[col] = numeric_series.fillna(numeric_series.median())
+                    else:
+                        logger.warning(
+                            f"Numeric column {col} has no valid numeric values after coercion; filling with 0."
+                        )
+                        df[col] = numeric_series.fillna(0)
         
         return df
     
@@ -277,11 +287,17 @@ class FeatureEngineer:
         
         for col1, col2 in interactions:
             if col1 in df.columns and col2 in df.columns:
+                # Enforce numeric dtype for interaction operands. This keeps
+                # the original formulas unchanged while preventing mixed
+                # float/Decimal runtime errors.
+                left = pd.to_numeric(df[col1], errors='coerce')
+                right = pd.to_numeric(df[col2], errors='coerce')
+
                 # Multiplication interaction
-                df[f'{col1}_X_{col2}'] = df[col1] * df[col2]
+                df[f'{col1}_X_{col2}'] = left * right
                 
                 # Ratio interaction (avoiding division by zero)
-                df[f'{col1}_div_{col2}'] = df[col1] / (df[col2] + 1)
+                df[f'{col1}_div_{col2}'] = left / (right + 1)
         
         return df
     
