@@ -7,7 +7,7 @@ import io
 import os
 import sys
 from contextlib import redirect_stdout
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import json
 from urllib.error import HTTPError, URLError
@@ -278,20 +278,25 @@ def _split_sql_statements(query_content: str) -> list[str]:
 
 def _execute_sql(sql_path: Path,
                  label: str,
-                 summary: str) -> None:
+                 summary: str,
+                 query_content_override: str | None = None,
+                 sql_display_name: str | None = None) -> None:
     """Execute a SQL file using shared Spark session."""
-    print(f"\nPASO {label}: Ejecutando {sql_path.name}...")
+    display_name = sql_display_name or sql_path.name
+    print(f"\nPASO {label}: Ejecutando {display_name}...")
     print("----------------------------------------")
 
-    if not sql_path.is_file():
-        raise FileNotFoundError(f"No se encuentra {sql_path}")
-
-    with sql_path.open("r", encoding="utf-8") as handle:
-        query_content = handle.read()
+    if query_content_override is None:
+        if not sql_path.is_file():
+            raise FileNotFoundError(f"No se encuentra {sql_path}")
+        with sql_path.open("r", encoding="utf-8") as handle:
+            query_content = handle.read()
+    else:
+        query_content = query_content_override
 
     statements = _split_sql_statements(query_content)
     if not statements:
-        print(f"⚠️  {sql_path.name} no contiene sentencias ejecutables")
+        print(f"⚠️  {display_name} no contiene sentencias ejecutables")
         return
 
     spark = _get_spark()
@@ -300,11 +305,83 @@ def _execute_sql(sql_path: Path,
         for statement in statements:
             spark.sql(statement)
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"✅ {sql_path.name} ejecutada en {elapsed:.1f} segundos ({len(statements)} sentencias)")
+        print(f"✅ {display_name} ejecutada en {elapsed:.1f} segundos ({len(statements)} sentencias)")
         print(f"   {summary}")
     except Exception as exc:
-        print(f"❌ Error en {sql_path.name}: {exc}")
+        print(f"❌ Error en {display_name}: {exc}")
         raise
+
+
+def _render_query_diaria_for_date(query_content: str, processing_date: date) -> str:
+    """Render query_diaria.sql replacing 'ayer' expression with a fixed date."""
+    target_expr = "date_add(current_date(), -1)"
+    replacement = f"DATE('{processing_date.isoformat()}')"
+    return query_content.replace(target_expr, replacement)
+
+
+def _find_missing_base_dates(spark, lookback_days: int = 30) -> list[date]:
+    """Return dates with ALFIL data but no rows inserted in BASE."""
+    diagnostics_sql = f"""
+    WITH fechas AS (
+      SELECT explode(sequence(date_add(current_date(), -{lookback_days}), date_add(current_date(), -1), interval 1 day)) AS fecha
+    ),
+    alfil AS (
+      SELECT DATE(TO_DATE(FECHA_RECEPCION)) AS fecha, COUNT(*) AS n_alfil
+      FROM OPX.P_DDV_OPX_MDPREDICTIVO.SBN_LM_INPUT_DIARIO_ALFIL
+      WHERE DATE(TO_DATE(FECHA_RECEPCION)) >= date_add(current_date(), -{lookback_days})
+      GROUP BY DATE(TO_DATE(FECHA_RECEPCION))
+    ),
+    base AS (
+      SELECT DATE(FECHA_RECEPCION) AS fecha, COUNT(*) AS n_base
+      FROM OPX.P_DDV_OPX_MDPREDICTIVO.MODELO_LM_202507_BASE
+      WHERE DATE(FECHA_RECEPCION) >= date_add(current_date(), -{lookback_days})
+      GROUP BY DATE(FECHA_RECEPCION)
+    )
+    SELECT f.fecha
+    FROM fechas f
+    LEFT JOIN alfil a ON f.fecha = a.fecha
+    LEFT JOIN base b ON f.fecha = b.fecha
+    WHERE COALESCE(a.n_alfil, 0) > 0
+      AND COALESCE(b.n_base, 0) = 0
+    ORDER BY f.fecha
+    """
+
+    rows = spark.sql(diagnostics_sql).collect()
+    parsed_dates: list[date] = []
+    for row in rows:
+        raw = row["fecha"]
+        if isinstance(raw, datetime):
+            parsed_dates.append(raw.date())
+        elif isinstance(raw, date):
+            parsed_dates.append(raw)
+        elif raw is None:
+            continue
+        else:
+            parsed_dates.append(datetime.strptime(str(raw)[:10], "%Y-%m-%d").date())
+    return parsed_dates
+
+
+def _execute_query_diaria_backfill(spark, sql_path: Path, lookback_days: int = 30) -> list[date]:
+    """Execute query_diaria with fixed dates to backfill missing BASE days."""
+    missing_dates = _find_missing_base_dates(spark, lookback_days=lookback_days)
+    if not missing_dates:
+        print("\nPASO 0: Sin brechas detectadas entre ALFIL y BASE en ventana reciente.")
+        return []
+
+    with sql_path.open("r", encoding="utf-8") as handle:
+        raw_query = handle.read()
+
+    print(f"\nPASO 0: Detectadas {len(missing_dates)} fecha(s) faltantes para backfill en BASE.")
+    for idx, day in enumerate(missing_dates, start=1):
+        rendered_query = _render_query_diaria_for_date(raw_query, day)
+        _execute_sql(
+            sql_path=sql_path,
+            label=f"0.{idx}",
+            summary=f"Backfill ejecutado para FECHA_RECEPCION = {day.isoformat()}",
+            query_content_override=rendered_query,
+            sql_display_name=f"{sql_path.name} [backfill {day.isoformat()}]",
+        )
+    return missing_dates
 
 
 def main() -> int:
@@ -360,6 +437,18 @@ def main() -> int:
             else:
                 # 5) Ejecutar pasos SQL + scoring FT3.
                 try:
+                    backfill_days = _execute_query_diaria_backfill(
+                        spark=spark,
+                        sql_path=BASE_DIR / "query_diaria.sql",
+                        lookback_days=30,
+                    )
+                    if backfill_days:
+                        step_summaries.append(
+                            "0. query_diaria.sql backfill: "
+                            f"{len(backfill_days)} fecha(s) reprocesadas "
+                            f"({backfill_days[0]} a {backfill_days[-1]})"
+                        )
+
                     day_of_week = datetime.now().isoweekday()
                     if day_of_week == 1:
                         _execute_sql(
