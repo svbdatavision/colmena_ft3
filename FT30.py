@@ -13,6 +13,8 @@ ACTUALIZACIÓN 2025-08-06:
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import os
+from pathlib import Path
 import sys
 sys.path.append('src')
 from sklearn.metrics import confusion_matrix
@@ -22,6 +24,50 @@ from src.data_loader import SnowflakeDataLoader
 from src.feature_engineering import FeatureEngineer
 from src.model_training import LightGBMTrainer
 import joblib
+
+
+def _is_writable_directory(path: Path) -> bool:
+    """Valida que el directorio exista y permita escritura real."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe_file = path / f".write_probe_{os.getpid()}"
+        with open(probe_file, "w", encoding="utf-8") as handler:
+            handler.write("ok")
+        probe_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _get_results_dir() -> Path:
+    """
+    Obtiene una ruta escribible para reportes en Databricks/CLI.
+    Prioriza RESULTS_PATH y usa fallback seguro a almacenamiento local temporal.
+    """
+    env_results_path = os.getenv("RESULTS_PATH")
+    candidates = []
+
+    if env_results_path:
+        candidates.append(Path(env_results_path).expanduser())
+
+    candidates.extend(
+        [
+            Path("/dbfs/tmp/modelo-ft3/results"),
+            Path("/local_disk0/tmp/modelo-ft3/results"),
+            Path("/tmp/modelo-ft3/results"),
+            Path.cwd() / "results",
+        ]
+    )
+
+    for candidate in candidates:
+        if _is_writable_directory(candidate):
+            print(f"   ✓ Directorio de reportes: {candidate}")
+            return candidate
+
+    raise RuntimeError(
+        "No se encontró un directorio con permisos de escritura para reportes. "
+        "Configure RESULTS_PATH con una ruta válida."
+    )
 
 
 def _write_dataframe_to_table(conn, df, table_name, batch_size=1000, **_kwargs):
@@ -1400,7 +1446,8 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         
         # 8. GENERAR REPORTE EXCEL
         print("\n8. Generando reporte Excel...")
-        filename = f'results/reporte_completo_{timestamp}.xlsx'
+        results_dir = _get_results_dir()
+        filename = str(results_dir / f"reporte_completo_{timestamp}.xlsx")
         
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
             # Resumen ejecutivo
