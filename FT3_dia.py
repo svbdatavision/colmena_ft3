@@ -78,6 +78,17 @@ def _get_results_dir() -> Path:
     )
 
 
+def _safe_write_csv_report(df: pd.DataFrame, output_path: Path) -> str | None:
+    """Escribe un reporte CSV sin interrumpir el pipeline si falla."""
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        return str(output_path)
+    except Exception as exc:
+        print(f"   ⚠ No fue posible escribir {output_path}: {exc}")
+        return None
+
+
 def _write_dataframe_to_table(conn, df, table_name, batch_size=1000, **_kwargs):
     """
     Reemplazo compatible de write_pandas usando executemany sobre DB-API.
@@ -1359,92 +1370,125 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         print("\n8. Generando reporte Excel diario...")
         results_dir = _get_results_dir()
         filename = str(results_dir / f"reporte_dia_{timestamp}.xlsx")
-        
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            # Resumen ejecutivo
-            resumen = {
-                'Métrica': [
-                    'INFORMACIÓN GENERAL',
-                    'Período analizado',
-                    'Total licencias procesadas',
-                    '  - Con dictamen',
-                    '  - Pendientes',
-                    '',
-                    'LICENCIAS PENDIENTES - PREDICCIONES',
-                    '  - FT1 (ya aprobados)',
-                    '  - VERDE (recomendar aprobación)',
-                    '  - AMARILLO (revisar)',
-                    '  - ROJO (recomendar rechazo)',
-                    '',
-                    'LICENCIAS PENDIENTES EN VERDE',
-                    '  - Total casos',
-                    '  - Días solicitados',
-                    '',
-                    'VALIDACIÓN CON HISTÓRICO',
-                    '  - Precisión zona VERDE',
-                    '  - Falsos positivos',
-                    '',
-                    'UMBRALES UTILIZADOS',
-                    '  - Verde (aprobación)',
-                    '  - Amarillo (revisión)',
-                    '  - Rojo (rechazo)'
-                ],
-                'Valor': [
-                    '',
-                    f"{date_from} al {date_to}",
-                    f"{total_licencias:,}",
-                    f"{len(info_con_dictamen):,}",
-                    f"{len(info_pendientes):,}",
-                    '',
-                    '',
-                    f"{(info_pendientes['SEMAFORO'] == 'FT1_APROBADO').sum():,}",
-                    f"{(info_pendientes['SEMAFORO'] == 'VERDE').sum():,}",
-                    f"{(info_pendientes['SEMAFORO'] == 'AMARILLO').sum():,}",
-                    f"{(info_pendientes['SEMAFORO'] == 'ROJO').sum():,}",
-                    '',
-                    '',
-                    f"{len(verde_pendientes):,}" if len(verde_pendientes) > 0 else "0",
-                    f"{verde_pendientes['DIASSOLICITADO'].sum():,}" if len(verde_pendientes) > 0 else "0",
-                    '',
-                    '',
-                    f"{precision:.1%}" if len(verde_con_dictamen) > 0 else "N/A",
-                    f"{fp:,}" if len(verde_con_dictamen) > 0 else "N/A",
-                    '',
-                    '',
-                    f">= {optimal_verde:.2f}",
-                    f"{optimal_amarillo:.2f} - {optimal_verde:.2f}",
-                    f"< {optimal_amarillo:.2f}"
-                ]
-            }
-            
-            pd.DataFrame(resumen).to_excel(writer, sheet_name='Resumen', index=False)
-            
-            # Todas las pendientes ya ordenadas anteriormente
-            info_pendientes_sorted.to_excel(writer, sheet_name='Licencias_Pendientes', index=False)
-            
-            # Solo pendientes en verde
+        report_file = None
+
+        # Resumen ejecutivo (se reutiliza también en fallback CSV)
+        resumen = {
+            'Métrica': [
+                'INFORMACIÓN GENERAL',
+                'Período analizado',
+                'Total licencias procesadas',
+                '  - Con dictamen',
+                '  - Pendientes',
+                '',
+                'LICENCIAS PENDIENTES - PREDICCIONES',
+                '  - FT1 (ya aprobados)',
+                '  - VERDE (recomendar aprobación)',
+                '  - AMARILLO (revisar)',
+                '  - ROJO (recomendar rechazo)',
+                '',
+                'LICENCIAS PENDIENTES EN VERDE',
+                '  - Total casos',
+                '  - Días solicitados',
+                '',
+                'VALIDACIÓN CON HISTÓRICO',
+                '  - Precisión zona VERDE',
+                '  - Falsos positivos',
+                '',
+                'UMBRALES UTILIZADOS',
+                '  - Verde (aprobación)',
+                '  - Amarillo (revisión)',
+                '  - Rojo (rechazo)'
+            ],
+            'Valor': [
+                '',
+                f"{date_from} al {date_to}",
+                f"{total_licencias:,}",
+                f"{len(info_con_dictamen):,}",
+                f"{len(info_pendientes):,}",
+                '',
+                '',
+                f"{(info_pendientes['SEMAFORO'] == 'FT1_APROBADO').sum():,}",
+                f"{(info_pendientes['SEMAFORO'] == 'VERDE').sum():,}",
+                f"{(info_pendientes['SEMAFORO'] == 'AMARILLO').sum():,}",
+                f"{(info_pendientes['SEMAFORO'] == 'ROJO').sum():,}",
+                '',
+                '',
+                f"{len(verde_pendientes):,}" if len(verde_pendientes) > 0 else "0",
+                f"{verde_pendientes['DIASSOLICITADO'].sum():,}" if len(verde_pendientes) > 0 else "0",
+                '',
+                '',
+                f"{precision:.1%}" if len(verde_con_dictamen) > 0 else "N/A",
+                f"{fp:,}" if len(verde_con_dictamen) > 0 else "N/A",
+                '',
+                '',
+                f">= {optimal_verde:.2f}",
+                f"{optimal_amarillo:.2f} - {optimal_verde:.2f}",
+                f"< {optimal_amarillo:.2f}"
+            ]
+        }
+
+        try:
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                pd.DataFrame(resumen).to_excel(writer, sheet_name='Resumen', index=False)
+                info_pendientes_sorted.to_excel(writer, sheet_name='Licencias_Pendientes', index=False)
+
+                if len(verde_pendientes) > 0:
+                    verde_pendientes_sorted = verde_pendientes.sort_values(
+                        'PROBABILIDAD_APROBACION', ascending=False
+                    )
+                    verde_pendientes_sorted.to_excel(writer, sheet_name='Pendientes_Verde', index=False)
+
+                if len(info_con_dictamen) > 0:
+                    info_con_dictamen_sorted = info_con_dictamen.sort_values(
+                        ['SEMAFORO', 'PROBABILIDAD_APROBACION'],
+                        ascending=[True, False]
+                    )
+                    info_con_dictamen_sorted.to_excel(writer, sheet_name='Con_Dictamen', index=False)
+
+                if len(verde_con_dictamen) > 0:
+                    errores = verde_con_dictamen[verde_con_dictamen['TARGET_FT3'] == 0]
+                    if len(errores) > 0:
+                        errores_sorted = errores.sort_values('PROBABILIDAD_APROBACION', ascending=False)
+                        errores_sorted.to_excel(writer, sheet_name='Falsos_Positivos', index=False)
+
+            report_file = filename
+            print(f"\n✓ Reporte guardado exitosamente en: {filename}")
+        except Exception as report_exc:
+            print(f"   ⚠ Error al generar Excel ({report_exc}). Intentando fallback CSV...")
+            csv_prefix = f"reporte_dia_{timestamp}"
+            generated_reports = []
+
+            csv_resumen = _safe_write_csv_report(
+                pd.DataFrame(resumen),
+                results_dir / f"{csv_prefix}_resumen.csv"
+            )
+            if csv_resumen:
+                generated_reports.append(csv_resumen)
+
+            csv_pendientes = _safe_write_csv_report(
+                info_pendientes_sorted,
+                results_dir / f"{csv_prefix}_licencias_pendientes.csv"
+            )
+            if csv_pendientes:
+                generated_reports.append(csv_pendientes)
+
             if len(verde_pendientes) > 0:
-                verde_pendientes_sorted = verde_pendientes.sort_values(
-                    'PROBABILIDAD_APROBACION', ascending=False
+                csv_verde = _safe_write_csv_report(
+                    verde_pendientes.sort_values('PROBABILIDAD_APROBACION', ascending=False),
+                    results_dir / f"{csv_prefix}_pendientes_verde.csv"
                 )
-                verde_pendientes_sorted.to_excel(writer, sheet_name='Pendientes_Verde', index=False)
-            
-            # Licencias con dictamen (para validación)
-            if len(info_con_dictamen) > 0:
-                info_con_dictamen_sorted = info_con_dictamen.sort_values(
-                    ['SEMAFORO', 'PROBABILIDAD_APROBACION'], 
-                    ascending=[True, False]
-                )
-                info_con_dictamen_sorted.to_excel(writer, sheet_name='Con_Dictamen', index=False)
-            
-            # Errores del modelo (FP en verde)
-            if len(verde_con_dictamen) > 0:
-                errores = verde_con_dictamen[verde_con_dictamen['TARGET_FT3'] == 0]
-                if len(errores) > 0:
-                    errores_sorted = errores.sort_values('PROBABILIDAD_APROBACION', ascending=False)
-                    errores_sorted.to_excel(writer, sheet_name='Falsos_Positivos', index=False)
-        
-        print(f"\n✓ Reporte guardado exitosamente en: {filename}")
+                if csv_verde:
+                    generated_reports.append(csv_verde)
+
+            if generated_reports:
+                report_file = generated_reports[0]
+                print("   ✓ Fallback CSV generado:")
+                for report_path in generated_reports:
+                    print(f"     - {report_path}")
+            else:
+                print("   ⚠ No fue posible generar reporte en Excel ni CSV. Se continúa sin reporte.")
+
         print(f"\n✓ CONFIRMACIÓN: Se procesaron {total_licencias:,} licencias totales")
         print(f"  - Con dictamen: {len(info_con_dictamen):,}")
         print(f"  - Pendientes: {len(info_pendientes):,}")
@@ -1455,7 +1499,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
         
         if disconnect_after:
             loader.disconnect()
-        return filename
+        return report_file
 
     except Exception as e:
         print(f"\nError: {e}")

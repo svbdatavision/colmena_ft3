@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import time
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -213,6 +214,26 @@ def _split_sql_statements(query_content: str) -> list[str]:
     return statements
 
 
+def _read_text_with_retry(path: Path, retries: int = 3, base_wait_seconds: float = 2.0) -> str:
+    """Read text file with retries to mitigate intermittent workspace I/O errors."""
+    for attempt in range(1, retries + 1):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return handle.read()
+        except OSError as exc:
+            is_last_attempt = attempt == retries
+            if is_last_attempt:
+                raise
+            wait_seconds = base_wait_seconds * attempt
+            print(
+                f"⚠ Error de I/O leyendo {path.name} "
+                f"(intento {attempt}/{retries}): {exc}. Reintentando en {wait_seconds:.1f}s..."
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(f"No fue posible leer el archivo SQL: {path}")
+
+
 def _execute_sql(conn,
                  sql_path: Path,
                  label: str,
@@ -224,8 +245,7 @@ def _execute_sql(conn,
     if not sql_path.is_file():
         raise FileNotFoundError(f"No se encuentra {sql_path}")
 
-    with sql_path.open("r", encoding="utf-8") as handle:
-        query_content = handle.read()
+    query_content = _read_text_with_retry(sql_path)
 
     statements = _split_sql_statements(query_content)
     if not statements:
