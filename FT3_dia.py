@@ -824,7 +824,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     df_daily[col] = df_daily[col].dt.strftime('%Y-%m-%d %H:%M:%S').where(pd.notnull(df_daily[col]), None)
             
             # Tabla de predicciones diarias
-            tabla_diaria = "FT30_PREDICCIONES_DIARIAS"
+            tabla_diaria = _qualified_table_name(loader, "FT30_PREDICCIONES_DIARIAS")
             
             # Verificar si la tabla existe
             cursor = loader.conn.cursor()
@@ -882,7 +882,56 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             )
             """
             
-            cursor.execute(create_daily_table)
+            cursor.execute(_normalize_snowflake_ddl(create_daily_table))
+            required_columns_daily = [
+                ("AFILIADO_RUT", "VARCHAR(11)"),
+                ("LCC_COMCOD", "NUMBER(38,0)"),
+                ("LCC_COMCOR", "NUMBER(38,0)"),
+                ("LCC_OPERADOR", "NUMBER(38,0)"),
+                ("LCC_MEDRUT", "VARCHAR(11)"),
+                ("LCC_EMPRUT", "VARCHAR(11)"),
+                ("LCC_IDN", "VARCHAR(20)"),
+                ("EPISODIO_ACUM_DIAS", "NUMBER(38,0)"),
+                ("EPISODIO_FEC_INI", "DATE"),
+                ("CONTINUA_CALC", "VARCHAR(1)"),
+                ("TIPO_F_LM_COD", "NUMBER(38,0)"),
+                ("TIPO_F_LM", "VARCHAR(35)"),
+                ("FECHA_RECEPCION", "TIMESTAMP_NTZ(3)"),
+                ("FECHA_INICIO", "TIMESTAMP_NTZ(3)"),
+                ("FECHA_TERMINO", "TIMESTAMP_NTZ(3)"),
+                ("DIASSOLICITADO", "NUMBER(38,0)"),
+                ("CIE_F", "VARCHAR(120)"),
+                ("CIE_F_COD", "VARCHAR(12)"),
+                ("CIE_GRUPO", "VARCHAR(30)"),
+                ("LM_DIAGNOSTICO", "VARCHAR(100)"),
+                ("LM_ANTECEDENTES_CLINICOS", "VARCHAR(100)"),
+                ("COT_EDAD", "NUMBER(38,0)"),
+                ("COT_GENERO", "VARCHAR(4)"),
+                ("RENTA_ESTIMADA", "FLOAT"),
+                ("SEMAFORO", "VARCHAR(20)"),
+                ("PROBABILIDAD_APROBACION", "FLOAT"),
+                ("UMBRAL_VERDE", "FLOAT"),
+                ("UMBRAL_AMARILLO", "FLOAT"),
+                ("FECHA_PROCESAMIENTO", "TIMESTAMP_NTZ"),
+                ("FECHA_DESDE", "DATE"),
+                ("FECHA_HASTA", "DATE"),
+                ("MODELO_VERSION", "VARCHAR(10)"),
+                ("ES_PENDIENTE", "NUMBER(1,0)"),
+                ("TARGET_FT3", "NUMBER(1,0)"),
+                ("TARGET_APRUEBA", "NUMBER(1,0)"),
+                ("GLOSA_GENERADA", "VARCHAR(500)"),
+                ("CAUSAL_GENERADA", "VARCHAR(100)"),
+                ("LEAK_FT", "VARCHAR(100)"),
+                ("LEAK_CAUSALES", "VARCHAR(500)"),
+                ("LEAK_DIASAUTORIZADOS", "NUMBER(38,0)"),
+                ("LEAK_GLOSAS", "VARCHAR(500)"),
+                ("LEAK_ESTADOLM", "VARCHAR(35)"),
+                ("LEAK_FALLO_PE", "VARCHAR(255)"),
+            ]
+            for column_name, column_type in required_columns_daily:
+                cursor.execute(
+                    f"ALTER TABLE {tabla_diaria} ADD COLUMN IF NOT EXISTS {column_name} {_to_spark_sql_type(column_type)}"
+                )
             print(f"      ✓ Tabla {tabla_diaria} creada/verificada")
             
             # Crear tabla temporal para el MERGE
@@ -1208,71 +1257,107 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     df_snowflake_pendientes[col] = df_snowflake_pendientes[col].dt.strftime('%Y-%m-%d %H:%M:%S').where(pd.notnull(df_snowflake_pendientes[col]), None)
             
             # Nombre de la tabla fija (sin timestamp)
-            tabla_pendientes = "FT30_LICENCIAS_PENDIENTES"
+            tabla_pendientes = _qualified_table_name(loader, "FT30_LICENCIAS_PENDIENTES")
             
-            # Verificar si la tabla existe y obtener licencias ya procesadas
             cursor = loader.conn.cursor()
-            
-            # Verificar si la tabla existe
-            cursor.execute(f"SHOW TABLES LIKE '{tabla_pendientes}'")
-            table_exists = cursor.fetchone() is not None
-            
-            if not table_exists:
-                # Si la tabla no existe, crearla con el schema correcto
-                print(f"   - Creando tabla {tabla_pendientes} por primera vez...")
-                create_pendientes_table = f"""
-                CREATE TABLE {tabla_pendientes} (
-                    -- Primeros 20 campos (sin LCC_OPERADOR que no existe)
-                    AFILIADO_RUT VARCHAR(11),
-                    LCC_COMCOD NUMBER(38,0),
-                    LCC_COMCOR NUMBER(38,0),
-                    LCC_OPERADOR NUMBER(38,0),  -- NULL siempre, no existe en datos
-                    LCC_MEDRUT VARCHAR(11),     -- Viene de PRESTADOR_RUT
-                    LCC_EMPRUT VARCHAR(11),     -- Viene de EMPLEADOR_RUT
-                    LCC_IDN VARCHAR(20),        -- Ampliado para acomodar valores más largos
-                    EPISODIO_ACUM_DIAS NUMBER(38,0),
-                    EPISODIO_FEC_INI DATE,
-                    CONTINUA_CALC VARCHAR(1),
-                    TIPO_F_LM_COD NUMBER(38,0),
-                    TIPO_F_LM VARCHAR(35),
-                    FECHA_RECEPCION TIMESTAMP_NTZ(3),
-                    FECHA_INICIO TIMESTAMP_NTZ(3),
-                    FECHA_TERMINO TIMESTAMP_NTZ(3),
-                    DIASSOLICITADO NUMBER(38,0),
-                    CIE_F VARCHAR(120),
-                    CIE_F_COD VARCHAR(12),
-                    CIE_GRUPO VARCHAR(30),
-                    LM_DIAGNOSTICO VARCHAR(100),
-                    LM_ANTECEDENTES_CLINICOS VARCHAR(100),
-                    -- Campos adicionales de afiliado
-                    COT_EDAD NUMBER(38,0),
-                    COT_GENERO VARCHAR(4),
-                    RENTA_ESTIMADA FLOAT,
-                    -- Campos del modelo
-                    SEMAFORO VARCHAR(20),
-                    PROBABILIDAD_APROBACION FLOAT,
-                    UMBRAL_VERDE FLOAT,
-                    UMBRAL_AMARILLO FLOAT,
-                    FECHA_PROCESAMIENTO TIMESTAMP_NTZ,
-                    FECHA_PROCESAMIENTO_STR VARCHAR(50),
-                    MODELO_VERSION VARCHAR(10),
-                    TARGET_FT3 NUMBER(1,0),
-                    TARGET_APRUEBA NUMBER(1,0),
-                    GLOSA_GENERADA VARCHAR(500),
-                    CAUSAL_GENERADA VARCHAR(100),
-                    -- Campos LEAK para validación
-                    LEAK_FT VARCHAR(100),
-                    LEAK_CAUSALES VARCHAR(500),
-                    LEAK_DIASAUTORIZADOS NUMBER(38,0),
-                    LEAK_GLOSAS VARCHAR(500),
-                    LEAK_ESTADOLM VARCHAR(35),
-                    LEAK_FALLO_PE VARCHAR(255)
+            create_pendientes_table = f"""
+            CREATE TABLE IF NOT EXISTS {tabla_pendientes} (
+                -- Primeros 20 campos (sin LCC_OPERADOR que no existe)
+                AFILIADO_RUT VARCHAR(11),
+                LCC_COMCOD NUMBER(38,0),
+                LCC_COMCOR NUMBER(38,0),
+                LCC_OPERADOR NUMBER(38,0),  -- NULL siempre, no existe en datos
+                LCC_MEDRUT VARCHAR(11),     -- Viene de PRESTADOR_RUT
+                LCC_EMPRUT VARCHAR(11),     -- Viene de EMPLEADOR_RUT
+                LCC_IDN VARCHAR(20),        -- Ampliado para acomodar valores más largos
+                EPISODIO_ACUM_DIAS NUMBER(38,0),
+                EPISODIO_FEC_INI DATE,
+                CONTINUA_CALC VARCHAR(1),
+                TIPO_F_LM_COD NUMBER(38,0),
+                TIPO_F_LM VARCHAR(35),
+                FECHA_RECEPCION TIMESTAMP_NTZ(3),
+                FECHA_INICIO TIMESTAMP_NTZ(3),
+                FECHA_TERMINO TIMESTAMP_NTZ(3),
+                DIASSOLICITADO NUMBER(38,0),
+                CIE_F VARCHAR(120),
+                CIE_F_COD VARCHAR(12),
+                CIE_GRUPO VARCHAR(30),
+                LM_DIAGNOSTICO VARCHAR(100),
+                LM_ANTECEDENTES_CLINICOS VARCHAR(100),
+                -- Campos adicionales de afiliado
+                COT_EDAD NUMBER(38,0),
+                COT_GENERO VARCHAR(4),
+                RENTA_ESTIMADA FLOAT,
+                -- Campos del modelo
+                SEMAFORO VARCHAR(20),
+                PROBABILIDAD_APROBACION FLOAT,
+                UMBRAL_VERDE FLOAT,
+                UMBRAL_AMARILLO FLOAT,
+                FECHA_PROCESAMIENTO TIMESTAMP_NTZ,
+                FECHA_PROCESAMIENTO_STR VARCHAR(50),
+                MODELO_VERSION VARCHAR(10),
+                TARGET_FT3 NUMBER(1,0),
+                TARGET_APRUEBA NUMBER(1,0),
+                GLOSA_GENERADA VARCHAR(500),
+                CAUSAL_GENERADA VARCHAR(100),
+                -- Campos LEAK para validación
+                LEAK_FT VARCHAR(100),
+                LEAK_CAUSALES VARCHAR(500),
+                LEAK_DIASAUTORIZADOS NUMBER(38,0),
+                LEAK_GLOSAS VARCHAR(500),
+                LEAK_ESTADOLM VARCHAR(35),
+                LEAK_FALLO_PE VARCHAR(255)
+            )
+            """
+            cursor.execute(_normalize_snowflake_ddl(create_pendientes_table))
+            required_columns_pendiente_defs = [
+                ("AFILIADO_RUT", "VARCHAR(11)"),
+                ("LCC_COMCOD", "NUMBER(38,0)"),
+                ("LCC_COMCOR", "NUMBER(38,0)"),
+                ("LCC_OPERADOR", "NUMBER(38,0)"),
+                ("LCC_MEDRUT", "VARCHAR(11)"),
+                ("LCC_EMPRUT", "VARCHAR(11)"),
+                ("LCC_IDN", "VARCHAR(20)"),
+                ("EPISODIO_ACUM_DIAS", "NUMBER(38,0)"),
+                ("EPISODIO_FEC_INI", "DATE"),
+                ("CONTINUA_CALC", "VARCHAR(1)"),
+                ("TIPO_F_LM_COD", "NUMBER(38,0)"),
+                ("TIPO_F_LM", "VARCHAR(35)"),
+                ("FECHA_RECEPCION", "TIMESTAMP_NTZ(3)"),
+                ("FECHA_INICIO", "TIMESTAMP_NTZ(3)"),
+                ("FECHA_TERMINO", "TIMESTAMP_NTZ(3)"),
+                ("DIASSOLICITADO", "NUMBER(38,0)"),
+                ("CIE_F", "VARCHAR(120)"),
+                ("CIE_F_COD", "VARCHAR(12)"),
+                ("CIE_GRUPO", "VARCHAR(30)"),
+                ("LM_DIAGNOSTICO", "VARCHAR(100)"),
+                ("LM_ANTECEDENTES_CLINICOS", "VARCHAR(100)"),
+                ("COT_EDAD", "NUMBER(38,0)"),
+                ("COT_GENERO", "VARCHAR(4)"),
+                ("RENTA_ESTIMADA", "FLOAT"),
+                ("SEMAFORO", "VARCHAR(20)"),
+                ("PROBABILIDAD_APROBACION", "FLOAT"),
+                ("UMBRAL_VERDE", "FLOAT"),
+                ("UMBRAL_AMARILLO", "FLOAT"),
+                ("FECHA_PROCESAMIENTO", "TIMESTAMP_NTZ"),
+                ("FECHA_PROCESAMIENTO_STR", "VARCHAR(50)"),
+                ("MODELO_VERSION", "VARCHAR(10)"),
+                ("TARGET_FT3", "NUMBER(1,0)"),
+                ("TARGET_APRUEBA", "NUMBER(1,0)"),
+                ("GLOSA_GENERADA", "VARCHAR(500)"),
+                ("CAUSAL_GENERADA", "VARCHAR(100)"),
+                ("LEAK_FT", "VARCHAR(100)"),
+                ("LEAK_CAUSALES", "VARCHAR(500)"),
+                ("LEAK_DIASAUTORIZADOS", "NUMBER(38,0)"),
+                ("LEAK_GLOSAS", "VARCHAR(500)"),
+                ("LEAK_ESTADOLM", "VARCHAR(35)"),
+                ("LEAK_FALLO_PE", "VARCHAR(255)"),
+            ]
+            for column_name, column_type in required_columns_pendiente_defs:
+                cursor.execute(
+                    f"ALTER TABLE {tabla_pendientes} ADD COLUMN IF NOT EXISTS {column_name} {_to_spark_sql_type(column_type)}"
                 )
-                """
-                cursor.execute(create_pendientes_table)
-                print(f"      ✓ Tabla {tabla_pendientes} creada")
-            else:
-                print(f"   - Tabla {tabla_pendientes} ya existe")
+            print(f"   - Tabla {tabla_pendientes} creada/verificada (schema actualizado)")
             
             # Crear tabla temporal para MERGE de pendientes
             tabla_temp_pend = f"{tabla_pendientes}_TEMP"
@@ -1282,15 +1367,36 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
             if len(df_snowflake_pendientes) > 0:
                 print(f"   - Procesando {len(df_snowflake_pendientes):,} licencias pendientes...")
                 
+                required_columns_pend = [
+                    'AFILIADO_RUT', 'LCC_COMCOD', 'LCC_COMCOR', 'LCC_OPERADOR', 'LCC_MEDRUT', 'LCC_EMPRUT',
+                    'LCC_IDN', 'EPISODIO_ACUM_DIAS', 'EPISODIO_FEC_INI', 'CONTINUA_CALC', 'TIPO_F_LM_COD', 'TIPO_F_LM',
+                    'FECHA_RECEPCION', 'FECHA_INICIO', 'FECHA_TERMINO', 'DIASSOLICITADO', 'CIE_F', 'CIE_F_COD',
+                    'CIE_GRUPO', 'LM_DIAGNOSTICO', 'LM_ANTECEDENTES_CLINICOS', 'COT_EDAD', 'COT_GENERO',
+                    'RENTA_ESTIMADA', 'SEMAFORO', 'PROBABILIDAD_APROBACION', 'UMBRAL_VERDE', 'UMBRAL_AMARILLO',
+                    'FECHA_PROCESAMIENTO', 'FECHA_PROCESAMIENTO_STR', 'MODELO_VERSION', 'TARGET_FT3',
+                    'TARGET_APRUEBA', 'GLOSA_GENERADA', 'CAUSAL_GENERADA', 'LEAK_FT', 'LEAK_CAUSALES',
+                    'LEAK_DIASAUTORIZADOS', 'LEAK_GLOSAS', 'LEAK_ESTADOLM', 'LEAK_FALLO_PE',
+                ]
+
+                for col in required_columns_pend:
+                    if col not in df_snowflake_pendientes.columns:
+                        df_snowflake_pendientes[col] = pd.Series([None] * len(df_snowflake_pendientes), index=df_snowflake_pendientes.index)
+
+                df_snowflake_pendientes['GLOSA_GENERADA'] = df_snowflake_pendientes['GLOSA_GENERADA'].astype(str).str[:500]
+                df_snowflake_pendientes['CAUSAL_GENERADA'] = df_snowflake_pendientes['CAUSAL_GENERADA'].astype(str).str[:100]
+                df_snowflake_pendientes['CIE_F'] = df_snowflake_pendientes['CIE_F'].astype(str).str[:120]
+                df_snowflake_pendientes['CIE_GRUPO'] = df_snowflake_pendientes['CIE_GRUPO'].astype(str).str[:30]
+                df_to_save_pend = df_snowflake_pendientes[required_columns_pend].copy()
+
                 # Cargar datos en tabla temporal
                 success, nchunks, nrows, _ = _write_dataframe_to_table(
                     conn=loader.conn,
-                    df=df_snowflake_pendientes,
+                    df=df_to_save_pend,
                     table_name=tabla_temp_pend,
                     database=loader.connection_params['database'],
                     schema=loader.connection_params['schema'],
                     quote_identifiers=False,
-                    auto_create_table=True,
+                    auto_create_table=False,
                     overwrite=False
                 )
                 

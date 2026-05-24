@@ -831,7 +831,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                     df_daily['LCC_COMCOR'].map(operador_map)
                 )
 
-            tabla_diaria = "FT30_PREDICCIONES_DIARIAS"
+            tabla_diaria = _qualified_table_name(loader, "FT30_PREDICCIONES_DIARIAS")
             cursor = loader.conn.cursor()
 
             create_daily_table = f"""
@@ -1205,7 +1205,7 @@ def apply_model_to_all_licenses(date_from=None, date_to=None,
                 )
             
             # Nombre de la tabla fija (sin timestamp)
-            tabla_pendientes = "FT30_LICENCIAS_PENDIENTES"
+            tabla_pendientes = _qualified_table_name(loader, "FT30_LICENCIAS_PENDIENTES")
             
             # Verificar si la tabla existe y obtener licencias ya procesadas
             cursor = loader.conn.cursor()
