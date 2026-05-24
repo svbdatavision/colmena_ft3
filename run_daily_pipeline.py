@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import sys
 import time
@@ -278,6 +279,9 @@ def _execute_sql(conn,
 
 def main() -> int:
     _load_environment()
+    # Reduce noisy Py4J INFO logs that flood Databricks job output.
+    logging.getLogger("py4j").setLevel(logging.WARNING)
+    logging.getLogger("py4j.clientserver").setLevel(logging.WARNING)
     teams_webhook_url = _get_teams_webhook_url()
     started_at = datetime.now()
 
