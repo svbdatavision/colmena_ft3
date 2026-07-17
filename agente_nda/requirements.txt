@@ -1,0 +1,10 @@
+# Dependencias del Agente IA para Clasificación de NDAs (MVP Streamlit).
+# Instalación: pip install -r requirements.txt
+
+streamlit
+pdfplumber
+python-docx
+scikit-learn
+pandas
+numpy
+matplotlib
